@@ -1,223 +1,255 @@
-# extraction.py
-# Bibliothèque de fonctions d'extraction/encodage basées sur FFmpeg pour être utilisées dans main.py.
-# Conçu pour Streamlit Cloud : pas d'installation système si un binaire statique est fourni dans ./bin/ffmpeg.
-# Toutes les fonctions et commentaires sont en français.
+# main.py
+# Application Streamlit pour extraction vidéo/son/images et timelapse via FFmpeg.
+# Toutes les fonctions et commentaires sont en français. Compatible Streamlit Cloud.
 
 import os
-import shutil
-import subprocess
+import time
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Optional
+
+import streamlit as st
+
+# Import du module local extraction.py
+from extraction import (
+    trouver_ffmpeg,
+    verifier_encodeurs_cles,
+    assurer_dossier,
+    encoder_video_h264_aac,
+    extraire_audio_mp3,
+    extraire_images_par_fps,
+    extraire_images_intervalle,
+    composer_timelapse_depuis_images,
+)
 
 # =========================================
-# Utilitaires système
+# Configuration de l'application
 # =========================================
 
-def assurer_dossier(chemin: str) -> None:
-    """Crée un dossier s'il n'existe pas, de façon idempotente."""
-    os.makedirs(chemin, exist_ok=True)
+st.set_page_config(page_title="Extraction vidéo, audio, images et timelapse", layout="wide")
 
-def trouver_ffmpeg() -> Optional[str]:
-    """Retourne le chemin exécutable vers ffmpeg. Priorité à ./bin/ffmpeg, sinon /usr/bin/ffmpeg, sinon PATH."""
-    local = os.path.abspath("./bin/ffmpeg")
-    if os.path.isfile(local) and os.access(local, os.X_OK):
-        return local
-    for cand in ["/usr/bin/ffmpeg", shutil.which("ffmpeg")]:
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
+BASE_DIR = Path("/tmp/appdata")
+FICHIERS_DIR = BASE_DIR / "fichiers"
+IMAGES_DIR = BASE_DIR / "images"
+TIMELAPSE_DIR = BASE_DIR / "timelapse"
 
-def _run_cmd(cmd: list) -> Tuple[bool, str]:
-    """Exécute une commande et retourne (ok, log). Capture stdout et stderr, renvoie le texte le plus utile."""
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        out = (res.stdout or "").strip()
-        err = (res.stderr or "").strip()
-        log = "\n".join([s for s in [out, err] if s]).strip()
-        return True, log
-    except subprocess.CalledProcessError as e:
-        out = (e.stdout or "").strip()
-        err = (e.stderr or "").strip()
-        log = "\n".join([s for s in [out, err] if s]).strip()
-        if not log:
-            log = str(e)
-        return False, log
-    except Exception as e:
-        return False, f"Erreur d'exécution : {e}"
-
-def verifier_encodeurs_cles(ffmpeg: str) -> Tuple[Dict[str, bool], str]:
-    """Vérifie la présence de libx264 et aac dans les encodeurs FFmpeg."""
-    try:
-        res = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, check=True)
-        txt = res.stdout
-    except Exception as e:
-        return {"libx264": False, "aac": False}, f"Impossible de lister les encodeurs : {e}"
-
-    rep = {"libx264": ("libx264" in txt), "aac": ("aac" in txt)}
-    warn = ""
-    if not rep["libx264"]:
-        warn += "libx264 introuvable dans ce binaire FFmpeg. "
-    if not rep["aac"]:
-        warn += "aac introuvable dans ce binaire FFmpeg. "
-    return rep, warn.strip()
+assurer_dossier(str(FICHIERS_DIR))
+assurer_dossier(str(IMAGES_DIR))
+assurer_dossier(str(TIMELAPSE_DIR))
 
 # =========================================
-# Fonctions d'encodage et d'extraction
+# Outils UI
 # =========================================
 
-def encoder_video_h264_aac(
-    ffmpeg: str,
-    chemin_entree: str,
-    chemin_sortie: str,
-    largeur: int = 1280,
-    crf: int = 28,
-    preset: str = "slow",
-    audio_bitrate: str = "96k",
-) -> Tuple[bool, str]:
-    """Encode la vidéo en H.264 + AAC, redimensionnée à 'largeur', yuv420p, et faststart."""
-    assurer_dossier(str(Path(chemin_sortie).parent))
-    filtre_scale = f"scale={int(largeur)}:-2"
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", chemin_entree,
-        "-vf", filtre_scale,
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", audio_bitrate,
-        "-ac", "2",
-        "-movflags", "+faststart",
-        chemin_sortie
-    ]
-    return _run_cmd(cmd)
+def nom_sans_extension(nom_fichier: str) -> str:
+    """Retourne le nom de fichier sans extension, nettoyé des caractères spéciaux."""
+    base = Path(nom_fichier).stem
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base)
 
-def extraire_audio_mp3(
-    ffmpeg: str,
-    chemin_entree: str,
-    chemin_sortie: str,
-    bitrate_audio: str = "128k",
-    mono: bool = False,
-) -> Tuple[bool, str]:
-    """Extrait l'audio en MP3 à partir de la vidéo source."""
-    assurer_dossier(str(Path(chemin_sortie).parent))
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", chemin_entree,
-    ]
-    if mono:
-        cmd += ["-ac", "1"]
-    cmd += ["-vn", "-c:a", "libmp3lame", "-b:a", bitrate_audio, chemin_sortie]
-    return _run_cmd(cmd)
-
-def extraire_images_par_fps(
-    ffmpeg: str,
-    chemin_entree: str,
-    dossier_sortie: str,
-    fps: int = 1,
-    largeur: int = 1280,
-) -> Tuple[bool, str, str]:
-    """Extrait des images fixes à fréquence donnée en i/s, redimensionnées à la largeur souhaitée."""
-    assurer_dossier(dossier_sortie)
-    motif = os.path.join(dossier_sortie, "img_%06d.jpg")
-    filtre = f"fps={int(fps)},scale={int(largeur)}:-2"
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", chemin_entree,
-        "-vf", filtre,
-        "-q:v", "2",
-        motif
-    ]
-    ok, log = _run_cmd(cmd)
-    return ok, log, motif
-
-def _parse_temps(t: str) -> str:
-    """Accepte 'HH:MM:SS' ou un nombre de secondes, et retourne un format accepté par FFmpeg."""
-    t = str(t).strip()
-    if t.count(":") in (1, 2):
-        return t
-    try:
-        s = float(t)
-        s = max(0, s)
-        heures = int(s // 3600)
-        minutes = int((s % 3600) // 60)
-        secondes = int(s % 60)
-        return f"{heures:02d}:{minutes:02d}:{secondes:02d}"
-    except Exception:
-        return t
-
-def extraire_images_intervalle(
-    ffmpeg: str,
-    chemin_entree: str,
-    chemin_sortie: str,
-    debut: str,
-    fin: str,
-    copy: bool = False,
-    largeur: int = 1280,
-    crf: int = 28,
-) -> Tuple[bool, str]:
-    """Extrait un intervalle de la vidéo, du temps 'debut' à 'fin'. Copie directe (-c copy) ou ré-encodage."""
-    assurer_dossier(str(Path(chemin_sortie).parent))
-    t0 = _parse_temps(debut)
-    t1 = _parse_temps(fin)
-
-    if copy:
-        cmd = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", t0, "-to", t1,
-            "-i", chemin_entree,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            chemin_sortie
-        ]
-        return _run_cmd(cmd)
+def afficher_logs_taches(titre: str, ok: bool, log: str, chemin_sortie: Optional[str] = None):
+    """Affiche un bloc de résultat standardisé avec le log détaillé."""
+    if ok:
+        st.success(f"{titre} terminé.")
+        if chemin_sortie and os.path.isfile(chemin_sortie):
+            st.caption(f"Fichier généré : {chemin_sortie}")
+        if log:
+            with st.expander("Journal FFmpeg (stdout/stderr)"):
+                st.code(log, language="bash")
     else:
-        filtre_scale = f"scale={int(largeur)}:-2"
-        cmd = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-ss", t0, "-to", t1,
-            "-i", chemin_entree,
-            "-vf", filtre_scale,
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", "slow",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            chemin_sortie
-        ]
-        return _run_cmd(cmd)
+        st.error(f"{titre} en échec.")
+        if log:
+            st.code(log, language="bash")
 
-def composer_timelapse_depuis_images(
-    ffmpeg: str,
-    dossier_images: str,
-    motif: str = "img_%06d.jpg",
-    fps: int = 10,
-    largeur: int = 1280,
-    crf: int = 28,
-) -> Tuple[bool, str]:
-    """Compose une vidéo timelapse depuis une séquence d'images numérotées (motif printf)."""
-    dossier = Path(dossier_images)
-    if not dossier.is_dir():
-        return False, f"Dossier images introuvable : {dossier_images}"
+def lire_fichier_binaire(chemin: str) -> bytes:
+    """Lit un fichier binaire en mémoire pour affichage ou téléchargement."""
+    with open(chemin, "rb") as f:
+        return f.read()
 
-    sortie = str(dossier.parent / "timelapse.mp4")
-    filtre_scale = f"scale={int(largeur)}:-2"
+# =========================================
+# Corps de l'app
+# =========================================
 
-    cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(int(fps)),
-        "-i", os.path.join(dossier_images, motif),
-        "-vf", filtre_scale,
-        "-c:v", "libx264",
-        "-crf", str(crf),
-        "-preset", "slow",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        sortie
-    ]
-    ok, log = _run_cmd(cmd)
-    return ok, log
+st.title("Extraction vidéo, audio, images et timelapse (FFmpeg)")
+
+ffmpeg_path = trouver_ffmpeg()
+if not ffmpeg_path:
+    st.error("FFmpeg introuvable. Dépose un binaire statique dans ./bin/ffmpeg ou vérifie /usr/bin/ffmpeg.")
+    st.stop()
+
+st.caption(f"FFmpeg utilisé : {ffmpeg_path}")
+
+encod_ok, encod_warn = verifier_encodeurs_cles(ffmpeg_path)
+col_a, col_b = st.columns(2)
+with col_a:
+    st.write("Encodeurs requis détectés")
+    st.json({"libx264": encod_ok.get("libx264", False), "aac": encod_ok.get("aac", False)})
+with col_b:
+    if encod_warn:
+        st.info(encod_warn)
+
+fichier = st.file_uploader("Déposer une vidéo (mp4, mov, m4v, mkv…)", type=["mp4", "mov", "m4v", "mkv"])
+if fichier is not None:
+    base_name = nom_sans_extension(fichier.name)
+    src_path = str(FICHIERS_DIR / f"{base_name}.mp4")
+    with open(src_path, "wb") as f:
+        f.write(fichier.read())
+    st.success(f"Fichier importé : {src_path}")
+
+    with open(src_path, "rb") as vf:
+        st.video(vf.read())
+
+    onglet1, onglet2, onglet3, onglet4, onglet5 = st.tabs([
+        "Encodage MP4 (H.264 + AAC)",
+        "Extraction audio MP3",
+        "Extraction images (1 fps / 25 fps / N fps)",
+        "Extraction par intervalle",
+        "Recomposition timelapse",
+    ])
+
+    # Encodage vidéo standard
+    with onglet1:
+        st.subheader("Encodage et normalisation de la vidéo")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            largeur = st.number_input("Largeur cible (px)", min_value=320, max_value=3840, value=1280, step=16)
+        with col2:
+            crf = st.slider("CRF (qualité, plus bas = meilleure)", min_value=18, max_value=35, value=28)
+        with col3:
+            preset = st.selectbox("Preset x264", ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], index=6)
+        with col4:
+            audio_kbps = st.selectbox("Débit audio", ["64k","96k","128k","160k","192k"], index=1)
+
+        if st.button("Lancer l'encodage", type="primary"):
+            dst_path = str(FICHIERS_DIR / f"{base_name}_full.mp4")
+            ok, log = encoder_video_h264_aac(
+                ffmpeg=ffmpeg_path,
+                chemin_entree=src_path,
+                chemin_sortie=dst_path,
+                largeur=int(largeur),
+                crf=int(crf),
+                preset=preset,
+                audio_bitrate=audio_kbps,
+            )
+            afficher_logs_taches("Encodage H.264/AAC", ok, log, dst_path)
+            if ok and os.path.isfile(dst_path):
+                st.video(lire_fichier_binaire(dst_path))
+                st.download_button("Télécharger la vidéo encodée", data=lire_fichier_binaire(dst_path), file_name=os.path.basename(dst_path), mime="video/mp4")
+
+    # Extraction audio MP3
+    with onglet2:
+        st.subheader("Extraction audio MP3")
+        col1, col2 = st.columns(2)
+        with col1:
+            mp3_bitrate = st.selectbox("Débit MP3", ["96k", "128k", "160k", "192k", "256k"], index=1)
+        with col2:
+            forcer_mono = st.checkbox("Forcer mono", value=False)
+
+        if st.button("Extraire MP3"):
+            mp3_path = str(FICHIERS_DIR / f"{base_name}.mp3")
+            ok, log = extraire_audio_mp3(
+                ffmpeg=ffmpeg_path,
+                chemin_entree=src_path,
+                chemin_sortie=mp3_path,
+                bitrate_audio=mp3_bitrate,
+                mono=forcer_mono,
+            )
+            afficher_logs_taches("Extraction audio MP3", ok, log, mp3_path)
+            if ok and os.path.isfile(mp3_path):
+                st.audio(lire_fichier_binaire(mp3_path))
+                st.download_button("Télécharger le MP3", data=lire_fichier_binaire(mp3_path), file_name=os.path.basename(mp3_path), mime="audio/mpeg")
+
+    # Extraction d'images
+    with onglet3:
+        st.subheader("Extraction d'images")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            choix_fps = st.selectbox("Choix du mode", ["1 image/s", "25 images/s", "N images/s"], index=0)
+        with col2:
+            n_fps = st.number_input("N images/s (si mode N)", min_value=1, max_value=120, value=10, step=1)
+        with col3:
+            largeur_img = st.number_input("Largeur des images (px)", min_value=160, max_value=3840, value=1280, step=16)
+
+        dossier_images = str(IMAGES_DIR / f"{base_name}_{int(time.time())}")
+        if st.button("Extraire les images"):
+            fps = 1 if choix_fps == "1 image/s" else (25 if choix_fps == "25 images/s" else int(n_fps))
+            ok, log, motif = extraire_images_par_fps(
+                ffmpeg=ffmpeg_path,
+                chemin_entree=src_path,
+                dossier_sortie=dossier_images,
+                fps=fps,
+                largeur=int(largeur_img),
+            )
+            afficher_logs_taches(f"Extraction d'images à {fps} i/s", ok, log, dossier_images)
+            if ok:
+                st.caption(f"Images écrites dans : {dossier_images}")
+                st.code(f"Motif des fichiers : {motif}")
+
+    # Extraction par intervalle
+    with onglet4:
+        st.subheader("Extraction par intervalle")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            debut = st.text_input("Début (HH:MM:SS ou secondes)", value="00:00:10")
+        with col2:
+            fin = st.text_input("Fin (HH:MM:SS ou secondes)", value="00:00:40")
+        with col3:
+            copie_sans_reencodage = st.checkbox("Copie directe (sans ré-encoder)", value=False, help="Utilise -c copy, plus rapide mais calé sur les keyframes.")
+
+        col4, col5 = st.columns(2)
+        with col4:
+            largeur_intervalle = st.number_input("Largeur si ré-encodage (px)", min_value=320, max_value=3840, value=1280, step=16)
+        with col5:
+            crf_intervalle = st.slider("CRF intervalle", min_value=18, max_value=35, value=28)
+
+        if st.button("Extraire la séquence"):
+            interval_path = str(FICHIERS_DIR / f"{base_name}_intervalle.mp4")
+            ok, log = extraire_images_intervalle(
+                ffmpeg=ffmpeg_path,
+                chemin_entree=src_path,
+                chemin_sortie=interval_path,
+                debut=debut,
+                fin=fin,
+                copy=copie_sans_reencodage,
+                largeur=int(largeur_intervalle),
+                crf=int(crf_intervalle),
+            )
+            afficher_logs_taches("Extraction par intervalle", ok, log, interval_path)
+            if ok and os.path.isfile(interval_path):
+                st.video(lire_fichier_binaire(interval_path))
+                st.download_button("Télécharger l'extrait", data=lire_fichier_binaire(interval_path), file_name=os.path.basename(interval_path), mime="video/mp4")
+
+    # Recomposition timelapse
+    with onglet5:
+        st.subheader("Recomposition en timelapse depuis images")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            fps_tl = st.selectbox("Fréquence timelapse (i/s)", [6, 8, 10, 12, 14], index=0)
+        with col2:
+            largeur_tl = st.number_input("Largeur timelapse (px)", min_value=320, max_value=3840, value=1280, step=16)
+        with col3:
+            crf_tl = st.slider("CRF timelapse", min_value=18, max_value=35, value=28)
+
+        st.caption("Choisir un dossier contenant des images numérotées (ex. img_000001.jpg).")
+        dossiers_disponibles = sorted([str(p) for p in IMAGES_DIR.glob(f"{base_name}_*") if p.is_dir()])
+        dossier_sel = st.selectbox("Dossier d'images détecté", options=["(aucun)"] + dossiers_disponibles, index=0)
+        motif_images = st.text_input("Motif d'images (printf-style)", value="img_%06d.jpg")
+
+        if st.button("Composer le timelapse"):
+            if dossier_sel == "(aucun)":
+                st.error("Aucun dossier d'images sélectionné.")
+            else:
+                sortie_tl = str(TIMELAPSE_DIR / f"{base_name}_timelapse_{fps_tl}fps.mp4")
+                ok, log = composer_timelapse_depuis_images(
+                    ffmpeg=ffmpeg_path,
+                    dossier_images=dossier_sel,
+                    motif=motif_images,
+                    fps=int(fps_tl),
+                    largeur=int(largeur_tl),
+                    crf=int(crf_tl),
+                )
+                afficher_logs_taches("Composition timelapse", ok, log, sortie_tl)
+                if ok and os.path.isfile(sortie_tl):
+                    st.video(lire_fichier_binaire(sortie_tl))
+                    st.download_button("Télécharger le timelapse", data=lire_fichier_binaire(sortie_tl), file_name=os.path.basename(sortie_tl), mime="video/mp4")
+
+else:
+    st.info("Dépose une vidéo pour activer les fonctions d'extraction et d'encodage.")
