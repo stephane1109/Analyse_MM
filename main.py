@@ -3,23 +3,69 @@
 # Toutes les fonctions et commentaires sont en français. Compatible Streamlit Cloud.
 
 import os
+import sys
 import time
+import importlib
+import importlib.util
 from pathlib import Path
 from typing import Optional
 
 import streamlit as st
 
-# Import du module local extraction.py
-from extraction import (
-    trouver_ffmpeg,
-    verifier_encodeurs_cles,
-    assurer_dossier,
-    encoder_video_h264_aac,
-    extraire_audio_mp3,
-    extraire_images_par_fps,
-    extraire_images_intervalle,
-    composer_timelapse_depuis_images,
-)
+# =========================================
+# Chargement robuste de extraction.py
+# =========================================
+
+def _charger_module_extraction():
+    """Charge le module extraction.py de façon robuste, même si le CWD n'est pas le dossier du script."""
+    # Tentative 1 : import classique
+    try:
+        return importlib.import_module("extraction")
+    except ModuleNotFoundError:
+        pass
+
+    # Tentative 2 : ajouter le dossier courant (celui de main.py) au sys.path puis réessayer
+    racine = Path(__file__).parent.resolve()
+    if str(racine) not in sys.path:
+        sys.path.insert(0, str(racine))
+    try:
+        return importlib.import_module("extraction")
+    except ModuleNotFoundError:
+        pass
+
+    # Tentative 3 : chargement direct par chemin absolu
+    candidat = racine / "extraction.py"
+    if candidat.exists():
+        spec = importlib.util.spec_from_file_location("extraction", str(candidat))
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        sys.modules["extraction"] = module
+        return module
+
+    # Échec : retourner None
+    return None
+
+_mod = _charger_module_extraction()
+if _mod is None:
+    st.set_page_config(page_title="Extraction vidéo/son/images et timelapse", layout="wide")
+    st.title("Erreur d’import du module extraction.py")
+    st.error(
+        "Impossible de charger le module local 'extraction.py'. "
+        "Vérifie que 'extraction.py' est bien au même niveau que 'main.py' dans le dépôt, "
+        "et que le nom du fichier est exactement 'extraction.py' (respect de la casse)."
+    )
+    st.stop()
+
+# Import des symboles depuis le module chargé
+trouver_ffmpeg                   = _mod.trouver_ffmpeg
+verifier_encodeurs_cles          = _mod.verifier_encodeurs_cles
+assurer_dossier                  = _mod.assurer_dossier
+encoder_video_h264_aac           = _mod.encoder_video_h264_aac
+extraire_audio_mp3               = _mod.extraire_audio_mp3
+extraire_images_par_fps          = _mod.extraire_images_par_fps
+extraire_images_intervalle       = _mod.extraire_images_intervalle
+composer_timelapse_depuis_images = _mod.composer_timelapse_depuis_images
 
 # =========================================
 # Configuration de l'application
@@ -77,6 +123,7 @@ if not ffmpeg_path:
 
 st.caption(f"FFmpeg utilisé : {ffmpeg_path}")
 
+# Diagnostic rapide des encodeurs
 encod_ok, encod_warn = verifier_encodeurs_cles(ffmpeg_path)
 col_a, col_b = st.columns(2)
 with col_a:
@@ -86,6 +133,7 @@ with col_b:
     if encod_warn:
         st.info(encod_warn)
 
+# Téléversement de la vidéo source
 fichier = st.file_uploader("Déposer une vidéo (mp4, mov, m4v, mkv…)", type=["mp4", "mov", "m4v", "mkv"])
 if fichier is not None:
     base_name = nom_sans_extension(fichier.name)
@@ -94,6 +142,7 @@ if fichier is not None:
         f.write(fichier.read())
     st.success(f"Fichier importé : {src_path}")
 
+    # Prévisualisation
     with open(src_path, "rb") as vf:
         st.video(vf.read())
 
