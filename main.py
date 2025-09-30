@@ -13,37 +13,59 @@ from typing import Optional
 import streamlit as st
 
 # =========================================
-# Chargement robuste de extraction.py
+# Chargement robuste de extraction.py (racine OU pages/extraction.py)
 # =========================================
 
 def _charger_module_extraction():
-    """Charge le module extraction.py de façon robuste, même si le CWD n'est pas le dossier du script."""
-    # Tentative 1 : import classique
+    """Charge le module extraction, même s'il est placé dans ./pages/extraction.py.
+    Ordre des tentatives :
+      1) import extraction
+      2) import pages.extraction
+      3) ajout de chemins au sys.path puis 1) et 2) à nouveau
+      4) chargement direct par chemin : ./extraction.py puis ./pages/extraction.py
+    """
+    # Tentative 1 : import direct
     try:
         return importlib.import_module("extraction")
     except ModuleNotFoundError:
         pass
 
-    # Tentative 2 : ajouter le dossier courant (celui de main.py) au sys.path puis réessayer
+    # Tentative 2 : import sous-package pages
+    try:
+        return importlib.import_module("pages.extraction")
+    except ModuleNotFoundError:
+        pass
+
+    # Tentative 3 : forcer les chemins
     racine = Path(__file__).parent.resolve()
-    if str(racine) not in sys.path:
-        sys.path.insert(0, str(racine))
-    try:
-        return importlib.import_module("extraction")
-    except ModuleNotFoundError:
-        pass
+    pages_dir = racine / "pages"
 
-    # Tentative 3 : chargement direct par chemin absolu
-    candidat = racine / "extraction.py"
-    if candidat.exists():
-        spec = importlib.util.spec_from_file_location("extraction", str(candidat))
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        sys.modules["extraction"] = module
-        return module
+    chemins_a_ajouter = [str(racine)]
+    if pages_dir.exists():
+        chemins_a_ajouter.append(str(pages_dir))
 
-    # Échec : retourner None
+    for p in chemins_a_ajouter:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    # Réessayer l'import après injection des chemins
+    for nom in ("extraction", "pages.extraction"):
+        try:
+            return importlib.import_module(nom)
+        except ModuleNotFoundError:
+            continue
+
+    # Tentative 4 : chargement direct par chemin de fichier
+    candidats = [racine / "extraction.py", pages_dir / "extraction.py"]
+    for chemin in candidats:
+        if chemin.exists():
+            spec = importlib.util.spec_from_file_location("extraction", str(chemin))
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            sys.modules["extraction"] = module
+            return module
+
     return None
 
 _mod = _charger_module_extraction()
@@ -51,9 +73,10 @@ if _mod is None:
     st.set_page_config(page_title="Extraction vidéo/son/images et timelapse", layout="wide")
     st.title("Erreur d’import du module extraction.py")
     st.error(
-        "Impossible de charger le module local 'extraction.py'. "
-        "Vérifie que 'extraction.py' est bien au même niveau que 'main.py' dans le dépôt, "
-        "et que le nom du fichier est exactement 'extraction.py' (respect de la casse)."
+        "Impossible de charger le module local 'extraction.py'.\n"
+        "- Si ton fichier est dans 'pages/extraction.py', laisse-le là (c’est géré).\n"
+        "- Sinon, place 'extraction.py' à côté de 'main.py'.\n"
+        "Vérifie aussi la casse exacte du nom de fichier."
     )
     st.stop()
 
