@@ -1,7 +1,6 @@
-# _1_extraction.py
+# extraction.py
 # Bibliothèque de fonctions d'extraction/encodage basées sur FFmpeg pour être utilisées dans main.py.
-# Conçu pour Streamlit Cloud : pas d'installation système nécessaire si un binaire statique est fourni dans ./bin/ffmpeg.
-# Toutes les fonctions et commentaires sont en français, les erreurs de FFmpeg sont capturées et renvoyées.
+# Conçu pour Streamlit Cloud : binaire statique possible dans ./bin/ffmpeg. Toutes les fonctions et commentaires sont en français.
 
 import os
 import shutil
@@ -18,7 +17,7 @@ def assurer_dossier(chemin: str) -> None:
     os.makedirs(chemin, exist_ok=True)
 
 def trouver_ffmpeg() -> Optional[str]:
-    """Retourne le chemin exécutable vers ffmpeg. Priorité à ./bin/ffmpeg, sinon /usr/bin/ffmpeg, sinon PATH."""
+    """Retourne le chemin exécutable vers ffmpeg. Priorité à ./bin/ffmpeg, sinon /usr/bin/ffmpeg, sinon ce qui est dans PATH."""
     local = os.path.abspath("./bin/ffmpeg")
     if os.path.isfile(local) and os.access(local, os.X_OK):
         return local
@@ -46,7 +45,7 @@ def _run_cmd(cmd: list) -> Tuple[bool, str]:
         return False, f"Erreur d'exécution : {e}"
 
 def verifier_encodeurs_cles(ffmpeg: str) -> Tuple[Dict[str, bool], str]:
-    """Vérifie la présence de libx264 et aac dans les encodeurs FFmpeg."""
+    """Vérifie la présence de libx264 et aac dans les encodeurs du FFmpeg utilisé."""
     try:
         res = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True, check=True)
         txt = res.stdout
@@ -74,7 +73,7 @@ def encoder_video_h264_aac(
     preset: str = "slow",
     audio_bitrate: str = "96k",
 ) -> Tuple[bool, str]:
-    """Encode la vidéo en H.264 + AAC, redimensionnée à 'largeur', yuv420p, et faststart."""
+    """Encode la vidéo en H.264 + AAC, redimensionnée à 'largeur', en yuv420p, avec faststart."""
     assurer_dossier(str(Path(chemin_sortie).parent))
     filtre_scale = f"scale={int(largeur)}:-2"
     cmd = [
@@ -133,12 +132,11 @@ def extraire_images_par_fps(
     return ok, log, motif
 
 def _parse_temps(t: str) -> str:
-    """Accepte soit 'HH:MM:SS' soit un nombre de secondes, et retourne un format accepté par FFmpeg."""
+    """Accepte 'HH:MM:SS' ou un nombre de secondes, et retourne un format accepté par FFmpeg."""
     t = str(t).strip()
     if t.count(":") in (1, 2):
         return t
     try:
-        # seconds -> HH:MM:SS
         s = float(t)
         s = max(0, s)
         heures = int(s // 3600)
@@ -146,7 +144,7 @@ def _parse_temps(t: str) -> str:
         secondes = int(s % 60)
         return f"{heures:02d}:{minutes:02d}:{secondes:02d}"
     except Exception:
-        return t  # laisser tel quel, ffmpeg renverra une erreur si invalide
+        return t
 
 def extraire_images_intervalle(
     ffmpeg: str,
@@ -158,13 +156,12 @@ def extraire_images_intervalle(
     largeur: int = 1280,
     crf: int = 28,
 ) -> Tuple[bool, str]:
-    """Extrait un intervalle de la vidéo, du temps 'debut' à 'fin' inclusivement approximatif. Peut copier sans ré-encodage ou ré-encoder."""
+    """Extrait un intervalle de la vidéo, du temps 'debut' à 'fin'. Copie directe (-c copy) ou ré-encodage."""
     assurer_dossier(str(Path(chemin_sortie).parent))
     t0 = _parse_temps(debut)
     t1 = _parse_temps(fin)
 
     if copy:
-        # Copie sans ré-encodage. Plus rapide, mais uniquement aux frontières de keyframes.
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
             "-ss", t0, "-to", t1,
@@ -175,7 +172,6 @@ def extraire_images_intervalle(
         ]
         return _run_cmd(cmd)
     else:
-        # Ré-encodage avec redimensionnement et H.264/AAC.
         filtre_scale = f"scale={int(largeur)}:-2"
         cmd = [
             ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -202,16 +198,14 @@ def composer_timelapse_depuis_images(
     largeur: int = 1280,
     crf: int = 28,
 ) -> Tuple[bool, str]:
-    """Compose une vidéo timelapse depuis une séquence d'images numérotées. Le motif utilise la numérotation printf."""
+    """Compose une vidéo timelapse depuis une séquence d'images numérotées."""
     dossier = Path(dossier_images)
     if not dossier.is_dir():
         return False, f"Dossier images introuvable : {dossier_images}"
 
-    # Sortie à côté du dossier images si non précisé par l'appelant
     sortie = str(dossier.parent / "timelapse.mp4")
-
-    # -framerate définit la cadence d'entrée des images; on peut garder fps aussi en sortie si besoin.
     filtre_scale = f"scale={int(largeur)}:-2"
+
     cmd = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
         "-framerate", str(int(fps)),
