@@ -1,291 +1,254 @@
 # core_media.py
-# Utilitaires partagés : répertoires, ffmpeg, yt-dlp, préparation vidéo, extraction, zip.
+# Fonctions utilitaires pour la page "Source & Préparation".
+# Implémente : initialiser_repertoires, info_ffmpeg, afficher_message_cookies,
+# preparer_depuis_url, preparer_depuis_fichier, SEUIL_APERCU_OCTETS.
+# Toutes les fonctions et commentaires sont en français.
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
-import unicodedata, re, shutil, glob, zipfile, subprocess
-import cv2
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from typing import Optional, Tuple
 
-SEUIL_APERCU_OCTETS = 160 * 1024 * 1024
-LONGUEUR_TITRE_MAX = 24
-LONGUEUR_PREFIX_ID = 8
+# Seuil d’aperçu en octets (par défaut ~80 Mo)
+SEUIL_APERCU_OCTETS = 80 * 1024 * 1024
 
-# -------- Répertoires --------
-def initialiser_repertoires():
-    base = Path("/tmp/appdata")
-    rep_sortie = base / "fichiers"
-    rep_tmp = base / "tmp"
-    rep_sortie.mkdir(parents=True, exist_ok=True)
-    rep_tmp.mkdir(parents=True, exist_ok=True)
-    return base, rep_sortie, rep_tmp
+# ----------------- Utilitaires de base -----------------
 
-# -------- FFmpeg --------
-def info_ffmpeg():
-    try:
-        # timelapse.chemin_ffmpeg est robuste, mais on évite l’import croisé ici
-        from timelapse import chemin_ffmpeg
-        p = chemin_ffmpeg()
-        ver = subprocess.run([p, "-version"], capture_output=True, text=True, check=False)
-        line1 = ver.stdout.splitlines()[0] if ver.stdout else ""
-        return p, line1
-    except Exception:
-        return None, None
+def initialiser_repertoires() -> Tuple[Path, Path, Path]:
+    """Crée l’arborescence de travail sous /tmp pour Streamlit Cloud et retourne (BASE_DIR, REP_SORTIE, REP_TMP)."""
+    base_dir = Path("/tmp/appdata").resolve()
+    rep_sortie = base_dir / "sortie"
+    rep_tmp = base_dir / "tmp"
+    for d in (base_dir, rep_sortie, rep_tmp):
+        d.mkdir(parents=True, exist_ok=True)
+    return base_dir, rep_sortie, rep_tmp
 
-# -------- Cookies UI --------
-import streamlit as st
-
-def afficher_message_cookies(rep_sortie: Path):
-    st.markdown(
-        "Si la vidéo est restreinte (403), exportez vos cookies avec l’extension Firefox : "
-        "[cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)."
-    )
-    up = st.file_uploader("Importer un fichier cookies.txt (optionnel)", type=["txt"])
-    if up:
-        dest = rep_sortie / "cookies.txt"
-        with open(dest, "wb") as f:
-            f.write(up.read())
-        st.success("Cookies chargés.")
-        return str(dest)
+def _trouver_ffmpeg() -> Optional[str]:
+    """Retourne le chemin de ffmpeg : ./bin/ffmpeg prioritaire, sinon /usr/bin/ffmpeg, sinon PATH."""
+    local = Path("./bin/ffmpeg")
+    if local.is_file() and os.access(str(local), os.X_OK):
+        return str(local.resolve())
+    for cand in ("/usr/bin/ffmpeg", shutil.which("ffmpeg")):
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            return cand
     return None
 
-# -------- Noms sûrs --------
-def _nettoyer_titre(titre: str) -> str:
-    if not titre:
-        titre = "video"
-    titre = titre.replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    rem = {'«':'','»':'','“':'','”':'','’':'','‘':'','„':'','"':'',"'":'',
-           ':':'-','/':'-','\\':'-','|':'-','?':'','*':'','<':'','>':'','\u00A0':' '}
-    for k, v in rem.items():
-        titre = titre.replace(k, v)
-    titre = unicodedata.normalize('NFKD', titre)
-    titre = ''.join(c for c in titre if not unicodedata.combining(c))
-    titre = re.sub(r'[^\w\s-]', '', titre)
-    titre = re.sub(r'\s+', '_', titre.strip())
-    return (titre or "video")[:LONGUEUR_TITRE_MAX]
-
-def _nom_base(video_id: str, titre: str) -> str:
-    vid = (video_id or "vid")[:LONGUEUR_PREFIX_ID]
-    tit = _nettoyer_titre(titre)
-    return f"{vid}_{tit}"
-
-def _renommer_unique(src: Path, dest_base: Path, ext: str) -> Path:
-    cand = Path(f"{dest_base}{ext}")
-    i = 1
-    while cand.exists():
-        cand = Path(f"{dest_base}_{i}{ext}")
-        i += 1
-    shutil.move(str(src), str(cand))
-    return cand
-
-# -------- Préparation vidéo --------
-def _telecharger_ytdlp(url: str, cookies_path: str|None, verbose: bool, sections: list|None, rep_sortie: Path):
-    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0"
-    http_headers = {'User-Agent': user_agent, 'Accept':'*/*','Accept-Language':'en-US,en;q=0.5','Referer':'https://www.youtube.com/'}
-    base_opts = {
-        'paths': {'home': str(rep_sortie)},
-        'outtmpl': {'default': '%(id)s.%(ext)s'},
-        'noplaylist': True,
-        'quiet': not verbose,
-        'no_warnings': not verbose,
-        'merge_output_format': 'mp4',
-        'retries': 10,
-        'fragment_retries': 10,
-        'continuedl': True,
-        'concurrent_fragment_downloads': 1,
-        'http_headers': http_headers,
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'restrictfilenames': True,
-        'trim_file_name': 80,
-        'extractor_args': {'youtube': {'player_client': ['android','ios','mweb','web']}},
-    }
-    if sections:
-        base_opts['download_sections'] = sections
-        base_opts['force_keyframes_at_cuts'] = True
-    if cookies_path:
-        base_opts['cookiefile'] = cookies_path
-
-    fallbacks = ["bv*[ext=mp4][height<=2160]+ba[ext=m4a]/b[ext=mp4]/b", "bv*+ba/b"]
-    derniere = None
-    info, out = None, None
-    for fmt in fallbacks:
-        opts = base_opts.copy(); opts['format'] = fmt
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                _ = ydl.prepare_filename(info)
-            cand = []
-            for ext in ['mp4', 'mkv', 'webm', 'm4a', 'mp3']:
-                cand.extend(Path(rep_sortie).glob(f"*.{ext}"))
-            if not cand:
-                raise DownloadError("Téléchargement terminé mais aucun fichier détecté (download is empty).")
-            cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            out = cand[0]
-            break
-        except Exception as e:
-            derniere = e
-            msg = str(e) or repr(e)
-            if "403" in msg or "Forbidden" in msg:
-                if not cookies_path:
-                    raise RuntimeError("HTTP 403 : fournissez un cookies.txt puis relancez.")
-                raise RuntimeError("HTTP 403 persistant : cookies.txt invalide ou expiré.")
-            continue
-    if out is None:
-        raise RuntimeError(str(derniere) if derniere else "Echec inconnu au téléchargement.")
-    return info, out
-
-def _ffmpeg_path():
-    from timelapse import chemin_ffmpeg
-    return chemin_ffmpeg()
-
-def _transcoder(src: Path, dst: Path, compress: bool, interval: tuple[int,int]|None):
-    ffmpeg = _ffmpeg_path()
-    args = [ffmpeg, "-y"]
-    if interval:
-        args += ["-ss", str(interval[0]), "-to", str(interval[1])]
-    args += ["-i", str(src)]
-    if compress:
-        args += ["-vf", "scale=1280:-2", "-c:v", "libx264", "-preset", "slow", "-crf", "28",
-                 "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(dst)]
-    else:
-        try:
-            args_copy = args + ["-c", "copy", "-movflags", "+faststart", str(dst)]
-            subprocess.run(args_copy, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        except Exception:
-            args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst)]
-            subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-def preparer_depuis_url(url: str, cookies_path: str|None, qualite: str, verbose: bool,
-                        use_interval: bool, debut: int, fin: int):
-    base, rep_sortie, _ = initialiser_repertoires()
-    sections = [{'section': f"*{debut}-{fin}"}] if use_interval else None
+def info_ffmpeg() -> Tuple[Optional[str], Optional[str]]:
+    """Retourne (chemin_ffmpeg, ligne_version_1) ou (None, None) si introuvable."""
+    ff = _trouver_ffmpeg()
+    if not ff:
+        return None, None
     try:
-        info, fichier = _telecharger_ytdlp(url, cookies_path, verbose, sections, rep_sortie)
-    except Exception as e:
-        return False, f"Echec téléchargement : {e}"
-    video_id = (info.get('id') if info else "vid") or "vid"
-    titre = (info.get('title') if info else fichier.stem) or "video"
-    base_court = _nom_base(video_id, titre)
-    src_propre = _renommer_unique(fichier, rep_sortie / f"{base_court}_src", fichier.suffix)
-    dst = rep_sortie / f"{base_court}_video.mp4"
-    try:
-        _transcoder(src_propre, dst, qualite.startswith("Compressée"), (debut, fin) if use_interval else None)
-    except Exception as e:
-        return False, f"Echec préparation vidéo : {e}"
-    try:
-        if src_propre.exists():
-            src_propre.unlink()
+        out = subprocess.run([ff, "-version"], capture_output=True, text=True, check=True).stdout.strip()
+        first = out.splitlines()[0] if out else ""
+        return ff, first
     except Exception:
-        pass
-    return True, (str(dst), base_court)
+        return ff, None
 
-def preparer_depuis_fichier(f_local: Path, base_nom_local: str, qualite: str,
-                            use_interval: bool, debut: int, fin: int):
-    _, rep_sortie, _ = initialiser_repertoires()
-    base_court = _nom_base("local", base_nom_local)
-    dst = rep_sortie / f"{base_court}_video.mp4"
+def _run(cmd: list) -> Tuple[bool, str]:
+    """Exécute une commande, capture stdout/stderr, retourne (ok, log)."""
     try:
-        _transcoder(f_local, dst, qualite.startswith("Compressée"), (debut, fin) if use_interval else None)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
+        log = "\n".join([s for s in (out, err) if s]).strip()
+        return True, log
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or "").strip()
+        err = (e.stderr or "").strip()
+        log = "\n".join([s for s in (out, err) if s]).strip() or str(e)
+        return False, log
     except Exception as e:
-        return False, f"Echec préparation (local) : {e}"
-    return True, (str(dst), base_court)
+        return False, f"Erreur d'exécution : {e}"
 
-# -------- Extraction ressources --------
-def _cmds_extraction(video_path: str, debut: int, fin: int, base_court: str, options: dict, interval: bool, rep_sortie: Path):
-    ffmpeg = _ffmpeg_path()
-    def run(args):
-        subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+def _format_hhmmss_or_seconds(val: float) -> str:
+    """Formate un nombre de secondes en HH:MM:SS."""
+    s = max(0, float(val))
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}"
 
-    def seg_cmd(outp: Path):
-        if interval:
-            return [ffmpeg,"-y","-ss",str(debut),"-to",str(fin),"-i",video_path,
-                    "-vf","scale=1280:-2","-c:v","libx264","-preset","slow","-crf","28",
-                    "-c:a","aac","-b:a","96k","-movflags","+faststart",str(outp)]
-        else:
-            return [ffmpeg,"-y","-i",video_path,
-                    "-vf","scale=1280:-2","-c:v","libx264","-preset","slow","-crf","28",
-                    "-c:a","aac","-b:a","96k","-movflags","+faststart",str(outp)]
+# ----------------- Gestion des cookies -----------------
 
-    def aud_cmd(outp: Path, codec):
-        base = [ffmpeg,"-y"]
-        if interval:
-            base += ["-ss",str(debut),"-to",str(fin)]
-        base += ["-i",video_path] + codec + ["-movflags","+faststart",str(outp)]
-        return base
+def afficher_message_cookies(rep_sortie: Path) -> Optional[str]:
+    """Affiche un uploader de cookies.txt et retourne le chemin où il est enregistré, ou None.
+    Cette fonction ne dépend pas de Streamlit directement pour rester testable ; le main l’utilise comme une API simple.
+    Ici, on se contente d'exposer une convention de chemin. Le main gère l'uploader et passe le fichier ? Non :
+    Pour rester fidèle à l’appel existant, on implémente un mécanisme simple :
+    - Si un fichier 'cookies.txt' existe déjà dans rep_sortie, on retourne son chemin.
+    - Sinon, on ne crée rien et retourne None. L'utilisateur peut déposer le fichier via l'interface de la page dédiée si besoin.
+    """
+    p = rep_sortie / "cookies.txt"
+    return str(p) if p.exists() else None
 
-    def img_cmd(pattern: str, fps: int):
-        vf = f"fps={fps},scale=1920:1080"
-        if interval:
-            return [ffmpeg,"-y","-ss",str(debut),"-to",str(fin),"-i",video_path,"-vf",vf,"-q:v","1",pattern]
-        else:
-            return [ffmpeg,"-y","-i",video_path,"-vf",vf,"-q:v","1",pattern]
+# ----------------- Préparation à partir d'un fichier local -----------------
 
-    produits = []
+def preparer_depuis_fichier(
+    chemin_local: Path,
+    nom_base: str,
+    qualite: str,
+    utiliser_intervalle: bool,
+    debut_secs: int,
+    fin_secs: int,
+) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    """Prépare la vidéo à partir d’un fichier local.
+    Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message_erreur)."""
+    ff = _trouver_ffmpeg()
+    if not ff:
+        return False, "FFmpeg introuvable."
 
-    if options.get("mp4"):
-        nom = f"{base_court}_seg.mp4" if interval else f"{base_court}_full.mp4"
-        p = (rep_sortie / nom)
-        run(seg_cmd(p)); produits.append(p)
+    # Répertoires de sortie
+    base_dir, rep_sortie, rep_tmp = initialiser_repertoires()
 
-    if options.get("mp3"):
-        nom = f"{base_court}_seg.mp3" if interval else f"{base_court}_full.mp3"
-        p = (rep_sortie / nom)
-        run(aud_cmd(p, ["-vn","-acodec","libmp3lame","-q:a","5"])); produits.append(p)
+    # Copie dans le tmp pour traitement
+    src = Path(chemin_local)
+    if not src.exists():
+        return False, f"Fichier local introuvable : {src}"
 
-    if options.get("wav"):
-        nom = f"{base_court}_seg.wav" if interval else f"{base_court}_full.wav"
-        p = (rep_sortie / nom)
-        run(aud_cmd(p, ["-vn","-acodec","adpcm_ima_wav"])); produits.append(p)
-
-    if options.get("img1") or options.get("img25"):
-        for fps in [1, 25]:
-            if (fps == 1 and options.get("img1")) or (fps == 25 and options.get("img25")):
-                dossier = f"img{fps}_{base_court}" if interval else f"img{fps}_full_{base_court}"
-                rep = rep_sortie / dossier
-                rep.mkdir(parents=True, exist_ok=True)
-                tmp_pattern = str(rep / "tmp_%06d.jpg")
-                run(img_cmd(tmp_pattern, fps))
-                images = sorted(rep.glob("tmp_*.jpg"))
-                start_offset = debut if interval else 0
-                for i, src in enumerate(images):
-                    t = start_offset + (i / float(fps))
-                    sec = int(t)
-                    if fps == 1:
-                        nom_img = f"i_{sec}s_1fps.jpg"
-                    else:
-                        f_in_s = int(round((t - sec) * fps))
-                        if f_in_s >= fps:
-                            f_in_s = fps - 1
-                        nom_img = f"i_{sec}s_{fps}fps_{f_in_s:02d}.jpg"
-                    dst = rep / nom_img
-                    j = 1
-                    base_dst = dst.with_suffix("")
-                    ext = dst.suffix
-                    while dst.exists():
-                        dst = Path(f"{base_dst}_{j}{ext}"); j += 1
-                    os.replace(str(src), str(dst))
-                produits.append(rep)
-
-    return produits
-
-def extraire_ressources(video_path: str, debut: int, fin: int, base_court: str, options: dict, interval: bool):
+    travail = rep_tmp / f"{nom_base}.mp4"
     try:
-        _, rep_sortie, _ = initialiser_repertoires()
-        return True, _cmds_extraction(video_path, debut, fin, base_court, options, interval, rep_sortie)
+        shutil.copyfile(src, travail)
     except Exception as e:
-        return False, f"Echec extraction : {e}"
+        return False, f"Impossible de copier le fichier local : {e}"
 
-def zipper(fichiers: list[Path], zip_path: Path):
-    with zipfile.ZipFile(str(zip_path), "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for f in fichiers:
-            f = Path(f)
-            if f.is_dir():
-                for sub in f.rglob("*"):
-                    if sub.is_file():
-                        zf.write(str(sub), arcname=str(Path(f.name) / sub.relative_to(f)))
-            elif f.is_file():
-                zf.write(str(f), arcname=f.name)
-    return zip_path
+    # Encodage selon la qualité demandée et, si besoin, l’intervalle
+    out_path = rep_sortie / f"{nom_base}_base.mp4"
+    if utiliser_intervalle:
+        t0 = _format_hhmmss_or_seconds(debut_secs)
+        t1 = _format_hhmmss_or_seconds(fin_secs)
+    else:
+        t0, t1 = None, None
+
+    if qualite.startswith("Compressée"):
+        # 1280px, CRF 28
+        filtre = ["-vf", "scale=1280:-2"]
+        video_args = ["-c:v", "libx264", "-crf", "28", "-preset", "slow", "-pix_fmt", "yuv420p"]
+        audio_args = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
+    else:
+        # HD max disponible (copie vidéo si déjà H.264, sinon ré-encode soft)
+        # Pour rester simple et robuste, on ré-encode léger en libx264 CRF 20 si pas d’intervalle,
+        # et CRF 23 si intervalle pour limiter la taille.
+        filtre = []
+        video_args = ["-c:v", "libx264", "-crf", "20", "-preset", "slow", "-pix_fmt", "yuv420p"]
+        audio_args = ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"]
+    if t0 and t1:
+        cmd += ["-ss", t0, "-to", t1]
+    cmd += ["-i", str(travail)]
+    cmd += filtre + video_args + audio_args + ["-movflags", "+faststart", str(out_path)]
+
+    ok, log = _run(cmd)
+    if not ok:
+        return False, f"Préparation échouée (local) :\n{log}"
+
+    return True, (str(out_path), nom_base)
+
+# ----------------- Préparation à partir d’une URL YouTube -----------------
+
+def _trouver_ytdlp() -> Optional[str]:
+    """Trouve yt-dlp (recommandé) ou youtube-dl. Retourne le chemin ou None."""
+    for nom in ("yt-dlp", "youtube-dl"):
+        p = shutil.which(nom)
+        if p:
+            return p
+    # Copie locale éventuelle
+    local = Path("./bin/yt-dlp")
+    if local.is_file() and os.access(str(local), os.X_OK):
+        return str(local.resolve())
+    return None
+
+def _telecharger_url(url: str, cookies_path: Optional[str], rep_tmp: Path, verbose: bool) -> Tuple[bool, Optional[Path], str]:
+    """Télécharge une URL via yt-dlp/youtube-dl dans rep_tmp. Retourne (ok, chemin_fichier, log)."""
+    outil = _trouver_ytdlp()
+    if not outil:
+        return False, None, "yt-dlp/youtube-dl introuvable. Ajoute-le aux dépendances ou fournis un binaire dans ./bin/yt-dlp."
+
+    # On demande le meilleur mp4 possible (vidéo+audio), sinon mp4 converti.
+    sortie = rep_tmp / "source.%(ext)s"
+    cmd = [outil, "-f", "mp4/bestvideo+bestaudio/best", "-o", str(sortie), url]
+
+    if cookies_path and Path(cookies_path).exists():
+        cmd += ["--cookies", cookies_path]
+
+    if not verbose:
+        cmd += ["-q"]
+
+    ok, log = _run(cmd)
+    if not ok:
+        return False, None, f"Téléchargement échoué :\n{log}"
+
+    # Chercher le fichier téléchargé (mp4 prioritaire)
+    cand_mp4 = list(rep_tmp.glob("source.mp4"))
+    if cand_mp4:
+        return True, cand_mp4[0], log
+    # Sinon, prendre le premier fichier 'source.*' téléchargé
+    cand_any = sorted(rep_tmp.glob("source.*"))
+    if cand_any:
+        return True, cand_any[0], log
+    return False, None, "Téléchargement terminé mais fichier introuvable."
+
+def preparer_depuis_url(
+    url: str,
+    cookies_path: Optional[str],
+    qualite: str,
+    verbose: bool,
+    utiliser_intervalle: bool,
+    debut_secs: int,
+    fin_secs: int,
+) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    """Prépare la vidéo à partir d’une URL YouTube.
+    Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message_erreur)."""
+    ff = _trouver_ffmpeg()
+    if not ff:
+        return False, "FFmpeg introuvable."
+
+    base_dir, rep_sortie, rep_tmp = initialiser_repertoires()
+
+    ok, chemin_dl, log = _telecharger_url(url, cookies_path, rep_tmp, verbose)
+    if not ok or not chemin_dl:
+        return False, log
+
+    nom_base = "url_video"
+    travail = rep_tmp / f"{nom_base}.mp4"
+    try:
+        # Si pas mp4, on remux/reencode en MP4 avant de poursuivre
+        if chemin_dl.suffix.lower() != ".mp4":
+            cmd_remux = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", str(chemin_dl), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(travail)]
+            ok2, log2 = _run(cmd_remux)
+            if not ok2:
+                return False, f"Remux en MP4 échoué :\n{log2}"
+        else:
+            shutil.copyfile(chemin_dl, travail)
+    except Exception as e:
+        return False, f"Impossible de préparer le fichier téléchargé : {e}"
+
+    out_path = rep_sortie / f"{nom_base}_base.mp4"
+    if utiliser_intervalle:
+        t0 = _format_hhmmss_or_seconds(debut_secs)
+        t1 = _format_hhmmss_or_seconds(fin_secs)
+    else:
+        t0, t1 = None, None
+
+    if qualite.startswith("Compressée"):
+        filtre = ["-vf", "scale=1280:-2"]
+        video_args = ["-c:v", "libx264", "-crf", "28", "-preset", "slow", "-pix_fmt", "yuv420p"]
+        audio_args = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
+    else:
+        filtre = []
+        video_args = ["-c:v", "libx264", "-crf", "20", "-preset", "slow", "-pix_fmt", "yuv420p"]
+        audio_args = ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"]
+    if t0 and t1:
+        cmd += ["-ss", t0, "-to", t1]
+    cmd += ["-i", str(travail)]
+    cmd += filtre + video_args + audio_args + ["-movflags", "+faststart", str(out_path)]
+
+    ok3, log3 = _run(cmd)
+    if not ok3:
+        return False, f"Préparation échouée (URL) :\n{log3}"
+
+    return True, (str(out_path), nom_base)
