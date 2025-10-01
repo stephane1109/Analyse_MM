@@ -1,20 +1,14 @@
 # pages/timelapse.py
-# Page de recomposition timelapse : utilise un dossier d’images pour créer une vidéo timelapse H.264/AAC.
-# Cette page suppose que la page d’extraction a pu générer un dossier d’images dans /tmp/appdata/images/<nom_base_court>.
+# Assemblage timelapse à partir d’un dossier d’images (img_%06d.jpg) produit par la page extraction.
+# Choix simple : cadence 6/8/10/12/14 i/s et définition (basse 1280p / HD 1920p).
 
-import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 import streamlit as st
 
-from core_media import (
-    initialiser_repertoires, info_ffmpeg
-)
+from core_media import initialiser_repertoires, info_ffmpeg
 
-# ----------------- Utilitaires -----------------
-
-def executer_commande(cmd: list):
-    """Exécute une commande système et retourne (ok, log)."""
+def _run(cmd: list):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
         out = (res.stdout or "").strip()
@@ -29,92 +23,59 @@ def executer_commande(cmd: list):
     except Exception as e:
         return False, f"Erreur d'exécution : {e}"
 
-def chemin_ffmpeg():
-    """Retourne le chemin de ffmpeg ou None."""
-    chemin, _ = info_ffmpeg()
-    return chemin
-
-def afficher_log(titre: str, ok: bool, log: str, chemin_sortie: str | None = None):
-    """Affiche un statut et le log éventuel."""
-    if ok:
-        st.success(f"{titre} terminé.")
-        if chemin_sortie and Path(chemin_sortie).exists():
-            st.caption(f"Fichier généré : {chemin_sortie}")
-        if log:
-            with st.expander("Journal FFmpeg"):
-                st.code(log, language="bash")
-    else:
-        st.error(f"{titre} en échec.")
-        if log:
-            st.code(log, language="bash")
-
-# ----------------- Initialisation -----------------
+def _ffmpeg():
+    p, _ = info_ffmpeg()
+    return p
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 st.set_page_config(page_title="Timelapse", layout="wide")
 st.title("Timelapse")
 st.markdown("**www.codeandcortex.fr**")
 
-# Nom de base hérité de la préparation (optionnel)
-nom_base_court = st.session_state.get("base_court")
-
-# Détection des dossiers d’images disponibles
-racine_images = (BASE_DIR / "images").resolve()
-dossiers = []
-if racine_images.exists():
-    for d in sorted(racine_images.iterdir()):
-        if d.is_dir():
-            dossiers.append(str(d))
-
-ff = chemin_ffmpeg()
-with st.expander("Diagnostic FFmpeg"):
-    st.write(f"ffmpeg : {ff or 'introuvable'}")
-    if not ff:
-        st.stop()
-
-if not dossiers:
-    st.info("Aucun dossier d’images détecté. Générez d’abord des images depuis la page Extraction.")
+ff = _ffmpeg()
+if not ff:
+    st.error("FFmpeg introuvable.")
     st.stop()
 
-# ----------------- Paramétrage timelapse -----------------
+racine_images = (BASE_DIR / "images").resolve()
+dossiers = [str(d) for d in sorted(racine_images.glob("*")) if d.is_dir()] if racine_images.exists() else []
+if not dossiers:
+    st.info("Aucun dossier d’images détecté. Générez d’abord des images dans la page Extraction.")
+    st.stop()
 
-# Pré-sélection si le dossier porte le nom base court
-index_defaut = 0
-if nom_base_court:
-    noms = [Path(d).name for d in dossiers]
-    if nom_base_court in noms:
-        index_defaut = noms.index(nom_base_court)
-
-dossier_sel = st.selectbox("Dossier d’images", options=dossiers, index=index_defaut)
+dossier_sel = st.selectbox("Dossier d’images", options=dossiers, index=0)
 motif = st.text_input("Motif d’images (printf-style)", value="img_%06d.jpg")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    fps_tl = st.selectbox("Fréquence timelapse (i/s)", [6, 8, 10, 12, 14], index=0)
-with col2:
-    largeur = st.number_input("Largeur de sortie (px)", min_value=320, max_value=3840, value=1280, step=16)
-with col3:
-    crf = st.slider("CRF (qualité H.264)", min_value=18, max_value=35, value=28)
+c1, c2 = st.columns(2)
+with c1:
+    fps = st.selectbox("Cadence (images/s)", [6, 8, 10, 12, 14], index=0)
+with c2:
+    defn = st.radio("Définition", ["Basse (1280p)", "HD (1920p)"], index=0, horizontal=True)
 
-nom_sortie = (nom_base_court or Path(dossier_sel).name) + f"_timelapse_{fps_tl}fps.mp4"
+w = 1280 if defn.startswith("Basse") else 1920
+nom_sortie = Path(dossier_sel).name + f"_timelapse_{fps}fps.mp4"
 sortie = (BASE_DIR / "timelapse" / nom_sortie).resolve()
 sortie.parent.mkdir(parents=True, exist_ok=True)
 
-if st.button("Composer le timelapse"):
+if st.button("Composer et télécharger"):
     cmd = [
         ff, "-y", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(int(fps_tl)),
+        "-framerate", str(int(fps)),
         "-i", str(Path(dossier_sel) / motif),
-        "-vf", f"scale={int(largeur)}:-2",
-        "-c:v", "libx264",
-        "-crf", str(crf),
-        "-preset", "slow",
+        "-vf", f"scale={w}:-2",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "28" if w == 1280 else "20",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(sortie)
     ]
-    ok, log = executer_commande(cmd)
-    afficher_log("Composition timelapse", ok, log, str(sortie))
+    ok, log = _run(cmd)
     if ok and sortie.exists():
-        st.video(sortie.read_bytes(), format="video/mp4")
-        st.download_button("Télécharger le timelapse", data=sortie.read_bytes(), file_name=sortie.name, mime="video/mp4")
+        data = sortie.read_bytes()
+        st.success(f"Timelapse prêt : {sortie.name}")
+        st.video(data, format="video/mp4")
+        st.download_button("Télécharger le timelapse", data=data, file_name=sortie.name, mime="video/mp4")
+        with st.expander("Journal FFmpeg"):
+            st.code(log, language="bash")
+    else:
+        st.error("Échec de la composition timelapse.")
+        st.code(log or "Aucun log", language="bash")
