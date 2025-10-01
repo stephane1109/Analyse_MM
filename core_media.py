@@ -2,9 +2,8 @@
 # Fonctions utilitaires pour la page "Source & Préparation".
 # Implémente : initialiser_repertoires, info_ffmpeg, afficher_message_cookies (avec uploader),
 # preparer_depuis_url, preparer_depuis_fichier, SEUIL_APERCU_OCTETS.
-# Ajout : _telecharger_url gère les cas SABR en testant plusieurs clients YouTube (android/ios/tv/web),
-#         une sélection de formats explicite mp4, et un parallélisme réduit pour éviter les fragments vides.
-# Toutes les fonctions et commentaires sont en français.
+# Téléchargement YouTube robuste : variantes de formats (HLS/MP4), clients android/ios/tv/web,
+# fragments en série, vérification de fichier non vide.
 
 import os
 import shutil
@@ -14,13 +13,10 @@ from typing import Optional, Tuple
 
 import streamlit as st
 
-# Seuil d’aperçu en octets (par défaut ~80 Mo)
 SEUIL_APERCU_OCTETS = 80 * 1024 * 1024
 
-# ----------------- Utilitaires de base -----------------
-
 def initialiser_repertoires() -> Tuple[Path, Path, Path]:
-    """Crée l’arborescence de travail sous /tmp pour Streamlit Cloud et retourne (BASE_DIR, REP_SORTIE, REP_TMP)."""
+    """Crée l’arborescence sous /tmp pour Streamlit Cloud et retourne (BASE_DIR, REP_SORTIE, REP_TMP)."""
     base_dir = Path("/tmp/appdata").resolve()
     rep_sortie = base_dir / "sortie"
     rep_tmp = base_dir / "tmp"
@@ -29,7 +25,7 @@ def initialiser_repertoires() -> Tuple[Path, Path, Path]:
     return base_dir, rep_sortie, rep_tmp
 
 def _trouver_ffmpeg() -> Optional[str]:
-    """Retourne le chemin de ffmpeg : ./bin/ffmpeg prioritaire, sinon /usr/bin/ffmpeg, sinon PATH."""
+    """Chemin de ffmpeg : ./bin/ffmpeg prioritaire, sinon /usr/bin/ffmpeg, sinon PATH."""
     local = Path("./bin/ffmpeg")
     if local.is_file() and os.access(str(local), os.X_OK):
         return str(local.resolve())
@@ -39,7 +35,7 @@ def _trouver_ffmpeg() -> Optional[str]:
     return None
 
 def info_ffmpeg() -> Tuple[Optional[str], Optional[str]]:
-    """Retourne (chemin_ffmpeg, ligne_version_1) ou (None, None) si introuvable."""
+    """Retourne (chemin_ffmpeg, 1re ligne de version) ou (None, None)."""
     ff = _trouver_ffmpeg()
     if not ff:
         return None, None
@@ -74,18 +70,11 @@ def _format_hhmmss_or_seconds(val: float) -> str:
     sec = int(s % 60)
     return f"{h:02d}:{m:02d}:{sec:02d}"
 
-# ----------------- Cookies : uploader intégré -----------------
-
 def afficher_message_cookies(rep_sortie: Path) -> Optional[str]:
-    """Affiche un uploader Streamlit pour déposer un fichier cookies.txt (optionnel).
-    - Si un fichier est déposé, il est sauvegardé sous rep_sortie / 'cookies.txt' et son chemin est renvoyé.
-    - Si aucun fichier n’est déposé mais qu’un cookies.txt existe déjà, on renvoie ce chemin.
-    - Sinon, on renvoie None.
-    """
+    """Uploader Streamlit pour cookies.txt. Enregistre dans rep_sortie/cookies.txt si fourni."""
     st.markdown("### Cookies (optionnel)")
     st.caption("Pour les vidéos restreintes (403), exporte tes cookies depuis Firefox avec l’extension cookies.txt, puis importe le fichier ici.")
     cookies_file = st.file_uploader("Importer cookies.txt", type=["txt"], key="cookies_uploader")
-
     cible = rep_sortie / "cookies.txt"
     if cookies_file is not None:
         try:
@@ -97,15 +86,11 @@ def afficher_message_cookies(rep_sortie: Path) -> Optional[str]:
         except Exception as e:
             st.error(f"Impossible d’enregistrer cookies.txt : {e}")
             return None
-
     if cible.exists():
         st.info(f"Un fichier cookies.txt existe déjà : {cible}")
         return str(cible)
-
     st.caption("Aucun fichier cookies.txt importé.")
     return None
-
-# ----------------- yt-dlp / youtube-dl -----------------
 
 def _trouver_ytdlp() -> Optional[str]:
     """Trouve yt-dlp (recommandé) ou youtube-dl. Retourne le chemin ou None."""
@@ -118,77 +103,100 @@ def _trouver_ytdlp() -> Optional[str]:
         return str(local.resolve())
     return None
 
-def _fich_dl_vraiment_non_vide(rep_tmp: Path) -> Optional[Path]:
-    """Retourne un fichier téléchargé 'source.*' non vide s'il existe, priorité au .mp4."""
+def _version_ytdlp(outil: str) -> str:
+    """Retourne la version de yt-dlp/youtube-dl sous forme de chaîne, ou '?'."""
+    try:
+        v = subprocess.run([outil, "--version"], capture_output=True, text=True, check=True).stdout.strip()
+        return v or "?"
+    except Exception:
+        return "?"
+
+def _fichier_non_vide(rep_tmp: Path) -> Optional[Path]:
+    """Retourne un 'source.*' non vide s’il existe (priorité .mp4)."""
     cand_mp4 = list(rep_tmp.glob("source.mp4"))
     for p in cand_mp4:
-        if p.stat().st_size > 0:
-            return p
-    cand_any = sorted(rep_tmp.glob("source.*"))
-    for p in cand_any:
-        if p.stat().st_size > 0:
-            return p
+        try:
+            if p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
+    for p in sorted(rep_tmp.glob("source.*")):
+        try:
+            if p.stat().st_size > 0:
+                return p
+        except Exception:
+            pass
     return None
 
 def _telecharger_url(url: str, cookies_path: Optional[str], rep_tmp: Path, verbose: bool) -> Tuple[bool, Optional[Path], str]:
-    """Télécharge une URL via yt-dlp/youtube-dl dans rep_tmp. Gère les cas SABR en testant plusieurs stratégies.
-    Retourne (ok, chemin_fichier, log détaillé)."""
-
+    """Télécharge une URL via yt-dlp/youtube-dl dans rep_tmp.
+    Stratégie : tente plusieurs formats (MP4/DASH/HLS) et clients (web/android/ios/tv), force fragments en série,
+    vérifie qu’un fichier non vide a été produit avant de valider."""
     outil = _trouver_ytdlp()
     if not outil:
         return False, None, "yt-dlp/youtube-dl introuvable. Ajoute-le aux dépendances ou fournis un binaire dans ./bin/yt-dlp."
+    ver = _version_ytdlp(outil)
 
     rep_tmp.mkdir(parents=True, exist_ok=True)
     sortie = rep_tmp / "source.%(ext)s"
 
-    # Sélection de format prioritaire mp4 ; fallback sur best si besoin
-    base_fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-
-    # UA « desktop » explicite pour écarter certains profils à pub serveur
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-
-    # Variantes à essayer pour contourner SABR / formats sans URL
-    variantes = [
-        ["-f", base_fmt],
-        ["-f", base_fmt, "--concurrent-fragments", "1"],
-        ["-f", base_fmt, "--extractor-args", "youtube:player_client=android", "--concurrent-fragments", "1"],
-        ["-f", base_fmt, "--extractor-args", "youtube:player_client=ios", "--concurrent-fragments", "1"],
-        ["-f", base_fmt, "--extractor-args", "youtube:player_client=tv", "--concurrent-fragments", "1"],
-        ["-f", base_fmt, "--user-agent", ua, "--add-header", "Accept-Language:en-US,en;q=0.9", "--concurrent-fragments", "1"],
+    # Sélecteurs de formats, du plus « propre MP4 » vers des fallbacks HLS/DASH.
+    # On privilégie avc1+m4a pour garantir un MP4 fusionnable, sinon HLS.
+    formats = [
+        "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]",
+        "bv*[vcodec^=avc1]+ba/bestvideo+bestaudio/best",
+        "bv*[protocol^=m3u8]+ba[protocol^=m3u8]/b[protocol^=m3u8]/best",
+        "bestvideo*+bestaudio*/best",
     ]
 
-    logs_cumul = []
-    for idx, extra in enumerate(variantes, start=1):
-        cmd = [outil, "-o", str(sortie)]
-        cmd += extra
-        # Merge/remux en mp4 si possible via ffmpeg
-        cmd += ["--merge-output-format", "mp4", "--restrict-filenames", "--ignore-no-formats-error"]
-        # Cookies si fournis
-        if cookies_path and Path(cookies_path).exists():
-            cmd += ["--cookies", cookies_path]
-        # Verbosité
-        if not verbose:
-            cmd += ["-q"]
-        cmd += [url]
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+    clients = [
+        None,
+        "youtube:player_client=android",
+        "youtube:player_client=ios",
+        "youtube:player_client=tv",
+        "youtube:player_client=web",
+    ]
 
-        ok, log = _run(cmd)
-        logs_cumul.append(f"\n=== Tentative {idx}/{len(variantes)} ===\n$ {' '.join(cmd)}\n{log}\n")
+    logs = []
+    tentative = 0
+    for fmt in formats:
+        for client in clients:
+            tentative += 1
+            cmd = [outil, "-o", str(sortie),
+                   "-f", fmt,
+                   "--merge-output-format", "mp4",
+                   "--restrict-filenames",
+                   "--ignore-no-formats-error",
+                   "--concurrent-fragments", "1",
+                   "--no-part",
+                   "--http-chunk-size", "1M",
+                   "--user-agent", ua,
+                   "--add-header", "Accept-Language:en-US,en;q=0.9"]
+            if client:
+                cmd += ["--extractor-args", client]
+            if cookies_path and Path(cookies_path).exists():
+                cmd += ["--cookies", cookies_path]
+            if not verbose:
+                cmd += ["-q"]
+            cmd += [url]
 
-        f = _fich_dl_vraiment_non_vide(rep_tmp)
-        if ok and f is not None and f.exists() and f.stat().st_size > 0:
-            return True, f, "".join(logs_cumul)
+            ok, log = _run(cmd)
+            logs.append(f"\n=== Tentative {tentative} | yt-dlp {ver} ===\n$ {' '.join(cmd)}\n{log}\n")
 
-        # Nettoyage entre tentatives si fichier vide créé
-        for p in rep_tmp.glob("source.*"):
-            try:
-                if p.is_file() and p.stat().st_size == 0:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
+            f = _fichier_non_vide(rep_tmp)
+            if ok and f is not None and f.exists() and f.stat().st_size > 0:
+                return True, f, "".join(logs)
 
-    return False, None, "Téléchargement échoué après plusieurs stratégies.\n" + "".join(logs_cumul)
+            # Nettoyage des fichiers vides éventuels avant la tentative suivante
+            for p in rep_tmp.glob("source.*"):
+                try:
+                    if p.is_file() and p.stat().st_size == 0:
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-# ----------------- Préparation à partir d’un fichier local -----------------
+    return False, None, "Téléchargement échoué : The downloaded file is empty.\n" + "".join(logs)
 
 def preparer_depuis_fichier(
     chemin_local: Path,
@@ -198,12 +206,10 @@ def preparer_depuis_fichier(
     debut_secs: int,
     fin_secs: int,
 ) -> Tuple[bool, Optional[Tuple[str, str]]]:
-    """Prépare la vidéo à partir d’un fichier local.
-    Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message_erreur)."""
+    """Prépare la vidéo à partir d’un fichier local. Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message)."""
     ff = _trouver_ffmpeg()
     if not ff:
         return False, "FFmpeg introuvable."
-
     base_dir, rep_sortie, rep_tmp = initialiser_repertoires()
 
     src = Path(chemin_local)
@@ -241,10 +247,7 @@ def preparer_depuis_fichier(
     ok, log = _run(cmd)
     if not ok:
         return False, f"Préparation échouée (local) :\n{log}"
-
     return True, (str(out_path), nom_base)
-
-# ----------------- Préparation à partir d’une URL YouTube -----------------
 
 def preparer_depuis_url(
     url: str,
@@ -255,12 +258,10 @@ def preparer_depuis_url(
     debut_secs: int,
     fin_secs: int,
 ) -> Tuple[bool, Optional[Tuple[str, str]]]:
-    """Prépare la vidéo à partir d’une URL YouTube.
-    Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message_erreur)."""
+    """Prépare la vidéo à partir d’une URL YouTube. Retourne (True, (chemin_video_base, nom_base_court)) ou (False, message)."""
     ff = _trouver_ffmpeg()
     if not ff:
         return False, "FFmpeg introuvable."
-
     base_dir, rep_sortie, rep_tmp = initialiser_repertoires()
 
     ok, chemin_dl, log_dl = _telecharger_url(url, cookies_path, rep_tmp, verbose)
@@ -271,7 +272,9 @@ def preparer_depuis_url(
     travail = rep_tmp / f"{nom_base}.mp4"
     try:
         if chemin_dl.suffix.lower() != ".mp4":
-            cmd_remux = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", str(chemin_dl), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(travail)]
+            cmd_remux = [ff, "-y", "-hide_banner", "-loglevel", "error",
+                         "-i", str(chemin_dl), "-c:v", "libx264", "-c:a", "aac",
+                         "-movflags", "+faststart", str(travail)]
             ok2, log2 = _run(cmd_remux)
             if not ok2:
                 return False, f"Remux en MP4 échoué :\n{log2}"
@@ -305,5 +308,4 @@ def preparer_depuis_url(
     ok3, log3 = _run(cmd)
     if not ok3:
         return False, f"Préparation échouée (URL) :\n{log3}\n\nLog téléchargement :\n{log_dl}"
-
     return True, (str(out_path), "url_video")
