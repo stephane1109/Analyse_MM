@@ -1,12 +1,12 @@
 # pages/analyse_mouvements.py
-# Analyse des mouvements complète avec :
+# Analyse des mouvements complète et robuste :
 # - Extraction FFmpeg 1080p (frames natives timelapse OU cadence fixe)
 # - Choix du PAS D’ANALYSE (intervalle entre frames analysées)
-# - Affichage robuste via PIL (Pillow)
-# - Calculs flux optique (OpenCV Farneback) et MÉTRIQUES par pas
-# - Score composite standardisé et ANOMALIES encadrées en rouge
+# - Affichage via PIL, calculs via OpenCV (conversion gris correcte)
+# - Réalignement des tailles avant Farneback pour éviter les échecs silencieux
+# - Métriques par pas + score composite + anomalies (encadrées en rouge)
 # - Aperçu global sur TOUTES les images extraites
-# - Tableaux, graphiques, téléchargements, explications détaillées
+# - Diagnostics détaillés (paires traitées/échouées, première erreur)
 
 import math
 import shutil
@@ -92,30 +92,27 @@ def extraire_frames_1080p(
 # Chargement et affichage images (PIL)
 # =============================
 
-def charger_images_pil(dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray], List[Path]]:
+def charger_images_pil(dossier: Path) -> Tuple[List[np.ndarray], List[Path]]:
     """
     Charge les images via PIL pour fiabiliser l'affichage Streamlit.
-    - rgbs_pil : liste d'images RGB (numpy uint8) pour affichage
-    - grays    : liste d'images grises (numpy uint8) pour calculs
+    - rgbs : liste d'images RGB (numpy uint8) pour affichage et conversion ultérieure en gris avec OpenCV
     - chemins  : fichiers correspondants
     """
     from PIL import Image
     fichiers = sorted(dossier.glob("frame_*.jpg"))
-    rgbs, grays = [], []
+    rgbs = []
     for f in fichiers:
         try:
             with Image.open(f) as im:
                 im = im.convert("RGB")
                 rgb = np.array(im)  # H x W x 3, uint8
-                gray = np.mean(rgb, axis=2).astype(np.uint8)  # luminance simple pour robustesse
                 rgbs.append(rgb)
-                grays.append(gray)
         except Exception:
             continue
-    return rgbs, grays, fichiers
+    return rgbs, fichiers
 
 def encadrer_rouge_pil(img_rgb: np.ndarray, epaisseur: int = 8) -> np.ndarray:
-    """Encadre une image RGB avec un cadre rouge (PIL-like, mais en numpy direct)."""
+    """Encadre une image RGB avec un cadre rouge (numpy direct)."""
     vis = img_rgb.copy()
     h, w = vis.shape[:2]
     e = max(1, int(epaisseur))
@@ -128,6 +125,20 @@ def encadrer_rouge_pil(img_rgb: np.ndarray, epaisseur: int = 8) -> np.ndarray:
 # =============================
 # Flux optique + métriques (OpenCV)
 # =============================
+
+def convertir_gris_cv2(cv2, img_rgb: np.ndarray) -> np.ndarray:
+    """Convertit une image RGB (numpy uint8) en niveaux de gris OpenCV correctement."""
+    bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return gray
+
+def redimensionner_si_diff(cv2, a: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Si tailles différentes, redimensionne b sur la taille de a (bilinéaire)."""
+    if a.shape[:2] == b.shape[:2]:
+        return a, b
+    h, w = a.shape[:2]
+    b_resize = cv2.resize(b, (w, h), interpolation=cv2.INTER_LINEAR)
+    return a, b_resize
 
 def farneback(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> Optional[np.ndarray]:
     """Flux optique dense Farneback (retourne (H,W,2) ou None en cas d'échec local)."""
@@ -259,7 +270,7 @@ if lancer:
         st.stop()
 
     # Chargement et APERÇU IMMÉDIAT (PIL)
-    imgs_rgb, imgs_gray, fichiers = charger_images_pil(frames_dir)
+    imgs_rgb, fichiers = charger_images_pil(frames_dir)
     total_frames = len(imgs_rgb)
     if total_frames < 2:
         st.error("Trop peu d’images extraites pour analyser (ou échec de lecture des JPG).")
@@ -291,14 +302,40 @@ if lancer:
     # Calcul du flux optique et des métriques entre frames espacées par 'pas'
     lignes: List[Dict[str, float]] = []
     echecs_pairs = 0
+    first_error_msg = None
 
     for k in range(1, len(indices)):
         i_prev = indices[k-1]
         i_curr = indices[k]
-        flow = farneback(cv2, imgs_gray[i_prev], imgs_gray[i_curr])
+
+        # Conversion en gris avec OpenCV
+        try:
+            gray_prev = convertir_gris_cv2(cv2, imgs_rgb[i_prev])
+            gray_curr = convertir_gris_cv2(cv2, imgs_rgb[i_curr])
+        except Exception as e:
+            echecs_pairs += 1
+            if first_error_msg is None:
+                first_error_msg = f"Conversion gris échec (frame {i_prev}->{i_curr}) : {e}"
+            continue
+
+        # Réalignement des tailles si nécessaire
+        try:
+            gray_prev, gray_curr = redimensionner_si_diff(cv2, gray_prev, gray_curr)
+        except Exception as e:
+            echecs_pairs += 1
+            if first_error_msg is None:
+                first_error_msg = f"Redimensionnement échec (frame {i_prev}->{i_curr}) : {e}"
+            continue
+
+        # Flux optique
+        flow = farneback(cv2, gray_prev, gray_curr)
         if flow is None:
             echecs_pairs += 1
+            if first_error_msg is None:
+                first_error_msg = f"Farneback échec (frame {i_prev}->{i_curr})"
             continue
+
+        # Métriques
         met = metriques_par_pas(flow)
         lignes.append({
             "etape": k,
@@ -312,12 +349,15 @@ if lancer:
             "dispersion_direction": met["dispersion_direction"],
         })
 
-    if not lignes:
-        st.error("Aucune paire valide pour le flux optique. Essaie pas=1 et « frames natives ».")
-        st.stop()
+    total_pairs = max(0, len(indices) - 1)
+    st.caption(f"Paires totales: {total_pairs} | Paires traitées: {len(lignes)} | Paires échouées: {echecs_pairs}")
+    if first_error_msg:
+        with st.expander("Première erreur rencontrée (diagnostic)"):
+            st.code(first_error_msg)
 
-    if echecs_pairs > 0:
-        st.warning(f"{echecs_pairs} paire(s) ont échoué au calcul du flux optique et ont été ignorées.")
+    if not lignes:
+        st.error("Aucune paire valide pour le flux optique. Essaie pas=1 et « frames natives » (ou vérifie opencv-python-headless).")
+        st.stop()
 
     df = pd.DataFrame(lignes)
 
