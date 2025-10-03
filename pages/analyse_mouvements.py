@@ -1,8 +1,11 @@
 # pages/analyse_mouvements.py
-# Analyse automatique des mouvements par flux optique avec intervalle optionnel et explications détaillées.
-# Principe : extraction d’images en 1080p à 4 i/s (FFmpeg) sur toute la vidéo ou un intervalle,
-# calcul du flux optique Farneback entre images consécutives, métriques par pas, baseline globale,
-# score composite standardisé (magnitude moyenne + énergie) et détection d’anomalies par z-score.
+# Analyse des mouvements avec choix de l'intervalle entre frames (pas d'analyse)
+# et visualisation des anomalies (encadrement rouge).
+# Source prioritaire : MP4 importé, sinon vidéo préparée.
+# Extraction d'images : mode "toutes les frames (timelapse/natif)" ou "cadence fixe (i/s)" en 1080p.
+# Calcul : flux optique Farneback entre paires consécutives du sous-échantillon choisi,
+# métriques par pas (magnitude moyenne, écart-type, p95, énergie, direction dominante, dispersion),
+# score composite (z(magnitude_moyenne) + z(énergie))/2, anomalies si z >= 2.5.
 
 import math
 import shutil
@@ -57,13 +60,16 @@ def extraire_frames_1080p(
     ffmpeg: str,
     video: Path,
     dossier: Path,
+    mode_extraction: str,
     fps_ech: int = 4,
     debut_s: Optional[float] = None,
     fin_s: Optional[float] = None
 ) -> Tuple[bool, str]:
     """
-    Extrait des images JPG en 1080p (largeur 1920) à fps_ech i/s.
-    Si un intervalle [debut_s, fin_s] est fourni, on le passe à FFmpeg pour ne traiter que cette portion.
+    Extrait des images JPG en 1080p (largeur 1920).
+    mode_extraction = "natifs" -> toutes les frames sources (timelapse, VFR), sans filtre fps.
+    mode_extraction = "fixe"   -> fps_ech images/seconde (uniforme).
+    Un intervalle temporel [debut_s, fin_s] peut être fourni (optionnel).
     Les fichiers sont nommés frame_%06d.jpg.
     """
     if dossier.exists():
@@ -72,21 +78,28 @@ def extraire_frames_1080p(
         except Exception:
             pass
     dossier.mkdir(parents=True, exist_ok=True)
-    motif = str(dossier / "frame_%06d.jpg")
-    filtre = f"fps={fps_ech},scale=1920:-2"
 
-    # Construction de la commande avec éventuel intervalle.
+    motif = str(dossier / "frame_%06d.jpg")
+
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     if debut_s is not None and debut_s > 0:
         cmd += ["-ss", str(float(debut_s))]
     if fin_s is not None and fin_s > 0 and (debut_s is None or fin_s > debut_s):
         cmd += ["-to", str(float(fin_s))]
-    cmd += ["-i", str(video), "-vf", filtre, "-q:v", "2", motif]
+    cmd += ["-i", str(video)]
+
+    if mode_extraction == "natifs":
+        # Toutes les frames en 1080p (sans imposer un fps). -vsync vfr conserve le rythme variable.
+        cmd += ["-vf", "scale=1920:-2", "-vsync", "vfr", "-q:v", "2", motif]
+    else:
+        # Cadence fixe fps_ech en 1080p.
+        filtre = f"fps={fps_ech},scale=1920:-2"
+        cmd += ["-vf", filtre, "-q:v", "2", motif]
 
     return executer(cmd)
 
 # =============================
-# Chargement des images
+# Chargement et utilitaires image
 # =============================
 
 def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray]]:
@@ -102,6 +115,13 @@ def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], Li
         grays.append(gray)
         rgbs.append(rgb)
     return grays, rgbs
+
+def encadrer_rouge(cv2, img_rgb: np.ndarray, epaisseur: int = 8) -> np.ndarray:
+    """Dessine un cadre rouge autour d'une image RGB pour signaler une anomalie."""
+    vis = img_rgb.copy()
+    h, w = vis.shape[:2]
+    cv2.rectangle(vis, (0, 0), (w-1, h-1), (255, 0, 0), thickness=epaisseur)
+    return vis
 
 # =============================
 # Flux optique + métriques
@@ -157,17 +177,16 @@ def zscore(x: np.ndarray) -> Tuple[np.ndarray, float, float]:
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Analyse des mouvements (intervalle et anomalies)", layout="wide")
-st.title("Analyse des mouvements (moyenne globale et anomalies)")
+st.set_page_config(page_title="Analyse des mouvements (pas d’analyse + anomalies)", layout="wide")
+st.title("Analyse des mouvements avec pas d’analyse et anomalies")
 st.markdown("**www.codeandcortex.fr**")
 
-# Explication concise des principes en tête de page.
 st.markdown(
-    "On estime le flux optique entre images successives extraites en 1080p à quatre images par seconde. "
-    "Pour chaque pas temporel, on calcule la magnitude moyenne, l’écart-type, le 95e percentile, l’énergie de mouvement, "
-    "ainsi que la direction dominante et sa dispersion. On construit ensuite un score composite à partir de la magnitude "
-    "moyenne et de l’énergie, standardisées par z-score pour les rendre comparables. Les pas dont le z-score composite est "
-    "nettement supérieur à la moyenne globale sont marqués comme anomalies."
+    "Principe général. Le flux optique estime les déplacements de pixels entre deux images successives. "
+    "Les images sont extraites en 1080p, soit à cadence fixe, soit en conservant toutes les frames natives, ce qui convient aux timelapses. "
+    "Pour chaque pas temporel, on calcule la magnitude moyenne, l’écart-type, le 95e percentile, l’énergie, la direction dominante et la dispersion. "
+    "Un score composite est formé en combinant les versions standardisées de la magnitude moyenne et de l’énergie. "
+    "Les pas dont le score composite dépasse nettement la moyenne (z ≥ 2.5) sont considérés comme des anomalies et sont encadrés en rouge."
 )
 
 ff = trouver_ffmpeg()
@@ -203,28 +222,34 @@ else:
     else:
         st.warning("Aucune vidéo préparée en mémoire. Importez un MP4.")
 
-# Intervalle optionnel
-st.subheader("Intervalle d’analyse (optionnel)")
-activer_intervalle = st.checkbox("Analyser uniquement un intervalle de la vidéo", value=False)
-debut_s = None
-fin_s = None
-if activer_intervalle:
-    c1, c2 = st.columns(2)
-    with c1:
-        debut_s = st.number_input("Début (secondes)", min_value=0.0, value=0.0, step=0.5)
-    with c2:
-        fin_s = st.number_input("Fin (secondes)", min_value=0.5, value=10.0, step=0.5)
-    if fin_s <= debut_s:
-        st.warning("La fin doit être strictement supérieure au début.")
+# Paramètres d’extraction et d’analyse
+st.subheader("Paramètres d’extraction et d’analyse")
+col1, col2, col3 = st.columns(3)
+with col1:
+    mode_extraction = st.radio("Mode d’extraction d’images", ["Toutes les frames (timelapse/natif)", "Cadence fixe (i/s)"], index=0)
+with col2:
+    fps_ech = st.number_input("Cadence fixe (si sélectionnée)", min_value=1, max_value=30, value=4, step=1)
+with col3:
+    pas_analyse = st.number_input("Pas d’analyse (1 = chaque image)", min_value=1, max_value=50, value=1, step=1)
 
-# Lancement
-if st.button("Analyser", type="primary"):
+st.caption(
+    "Le pas d’analyse contrôle l’intervalle entre images analysées après extraction. "
+    "Par exemple, un pas de 5 analysera les paires (frame 0 → 5), (5 → 10), etc. "
+    "En timelapse, un pas de 1 est généralement adapté puisque l’espacement est déjà grand. "
+    "En vidéo classique, augmenter le pas accélère l’analyse en sautant des frames intermédiaires. "
+    "Le mode d’extraction « toutes les frames » utilise le rythme natif ; la cadence fixe impose un sous-échantillonnage régulier."
+)
+
+lancer = st.button("Analyser", type="primary")
+
+if lancer:
     if video_path is None:
         st.error("Aucune source vidéo. Importez un MP4 ou sélectionnez la vidéo préparée.")
         st.stop()
 
     frames_dir = (BASE_DIR / "frames_analysis" / video_path.stem).resolve()
-    ok_ext, log_ext = extraire_frames_1080p(ff, video_path, frames_dir, fps_ech=4, debut_s=debut_s, fin_s=fin_s)
+    mode = "natifs" if mode_extraction.startswith("Toutes") else "fixe"
+    ok_ext, log_ext = extraire_frames_1080p(ff, video_path, frames_dir, mode_extraction=mode, fps_ech=int(fps_ech))
     if not ok_ext:
         st.error("Échec extraction des images avec FFmpeg.")
         with st.expander("Journal FFmpeg"):
@@ -238,16 +263,32 @@ if st.button("Analyser", type="primary"):
             st.code(log_ext or "(vide)", language="bash")
         st.stop()
 
-    # Calcul flux optique + métriques
+    # Sous-échantillonnage pour le pas d'analyse (1 = chaque image, 2 = une sur deux, etc.)
+    # On construit des indices 0, pas, 2*pas, ...
+    indices = list(range(0, len(imgs_gray), int(pas_analyse)))
+    if len(indices) < 2:
+        st.error("Le pas d’analyse est trop grand pour la longueur de la séquence.")
+        st.stop()
+
+    # Calcul du flux optique et des métriques entre images espacées par le pas choisi
     lignes: List[Dict[str, float]] = []
-    for i in range(1, len(imgs_gray)):
-        flow = farneback(cv2, imgs_gray[i-1], imgs_gray[i])
+    for k in range(1, len(indices)):
+        i_prev = indices[k-1]
+        i_curr = indices[k]
+        flow = farneback(cv2, imgs_gray[i_prev], imgs_gray[i_curr])
         met = metriques_par_pas(flow)
         lignes.append({
-            "pas_index": i,
-            "temps_s_approx": i / 4.0,
-            **met
+            "etape": k,
+            "frame_prev": i_prev,
+            "frame_curr": i_curr,
+            "magnitude_moyenne": met["magnitude_moyenne"],
+            "magnitude_ecart_type": met["magnitude_ecart_type"],
+            "magnitude_p95": met["magnitude_p95"],
+            "energie_mouvement": met["energie_mouvement"],
+            "direction_dominante_deg": met["direction_dominante_deg"],
+            "dispersion_direction": met["dispersion_direction"],
         })
+
     df = pd.DataFrame(lignes)
 
     # Baseline globale
@@ -256,7 +297,7 @@ if st.button("Analyser", type="primary"):
         "energie_mouvement", "direction_dominante_deg", "dispersion_direction"
     ]].mean(numeric_only=True).to_dict()
 
-    # Score composite et anomalies (seuil fixe, clair et robuste)
+    # Score composite et anomalies
     zM, _, _ = zscore(df["magnitude_moyenne"].to_numpy(dtype=np.float64))
     zE, _, _ = zscore(df["energie_mouvement"].to_numpy(dtype=np.float64))
     df["score_composite_z"] = (zM + zE) / 2.0
@@ -267,26 +308,32 @@ if st.button("Analyser", type="primary"):
     st.subheader("Moyennes globales (baseline)")
     st.dataframe(pd.DataFrame([moyennes_globales]).T.rename(columns={0: "valeur"}))
 
-    st.subheader("Anomalies détectées")
+    st.subheader("Anomalies détectées (encadrées en rouge)")
     nb_ano = int(df["anomalie"].sum())
     st.write(f"Nombre d’anomalies détectées : {nb_ano} (seuil z ≥ {seuil_z:.1f})")
+
+    # Vignettes des anomalies (top 16 par z décroissant), avec encadrement rouge
     if nb_ano > 0:
-        top_idx = df.sort_values("score_composite_z", ascending=False).head(16)["pas_index"].tolist()
+        ord_ano = df[df["anomalie"]].sort_values("score_composite_z", ascending=False)
+        top = ord_ano.head(16)
         cols_par_ligne = 8
         k = 0
-        for _ in range(math.ceil(len(top_idx) / cols_par_ligne)):
+        for _ in range(math.ceil(len(top) / cols_par_ligne)):
             cols = st.columns(cols_par_ligne)
             for c in cols:
-                if k >= len(top_idx):
+                if k >= len(top):
                     break
-                idx = int(top_idx[k])
+                row = top.iloc[k]
+                idx = int(row["frame_curr"])
+                z_here = float(row["score_composite_z"])
                 if 0 <= idx < len(imgs_rgb):
-                    z_here = df.loc[df["pas_index"] == idx, "score_composite_z"].values[0]
-                    c.image(imgs_rgb[idx], caption=f"#{idx} • z={z_here:.2f}", use_container_width=False)
+                    vis = encadrer_rouge(cv2, imgs_rgb[idx], epaisseur=8)
+                    c.image(vis, caption=f"frame #{idx} • z={z_here:.2f}", use_container_width=False)
                 k += 1
     else:
-        st.info("Aucune anomalie forte détectée sur la période analysée.")
+        st.info("Aucune anomalie forte détectée.")
 
+    # Téléchargement CSV
     st.subheader("Téléchargement des indices")
     st.download_button(
         "Télécharger les indices et anomalies (CSV)",
@@ -295,78 +342,74 @@ if st.button("Analyser", type="primary"):
         mime="text/csv"
     )
 
-    st.subheader("Aperçu global (vignettes réparties)")
-    N = len(imgs_rgb)
+    # Aperçu global réparti, avec encadrement si anomalie
+    st.subheader("Aperçu global (vignettes réparties, anomalies encadrées)")
+    N = len(indices)
     nb_vignettes = min(48, N)
-    idxs = np.linspace(0, N - 1, num=nb_vignettes, dtype=int)
+    sel = np.linspace(0, N - 1, num=nb_vignettes, dtype=int)
     cols_par_ligne = 8
-    k = 0
-    for _ in range(math.ceil(len(idxs) / cols_par_ligne)):
+    kk = 0
+    for _ in range(math.ceil(len(sel) / cols_par_ligne)):
         cols = st.columns(cols_par_ligne)
         for c in cols:
-            if k >= len(idxs):
+            if kk >= len(sel):
                 break
-            i = int(idxs[k])
-            z_here = df.loc[df["pas_index"] == i, "score_composite_z"]
-            cap = f"#{i}" + (f" • z={float(z_here.values[0]):.2f}" if len(z_here) else "")
-            c.image(imgs_rgb[i], caption=cap, use_container_width=False)
-            k += 1
+            kidx = int(sel[kk])
+            fr = indices[kidx]
+            # Chercher si cette frame est la destination d'un pas marqué anomalie
+            z_here = None
+            encadre = False
+            hit = df[df["frame_curr"] == fr]
+            if not hit.empty:
+                z_here = float(hit["score_composite_z"].iloc[0])
+                encadre = bool(hit["anomalie"].iloc[0])
+            if 0 <= fr < len(imgs_rgb):
+                img = encadrer_rouge(cv2, imgs_rgb[fr], epaisseur=6) if encadre else imgs_rgb[fr]
+                cap = f"frame #{fr}" + (f" • z={z_here:.2f}" if z_here is not None else "")
+                c.image(img, caption=cap, use_container_width=False)
+            kk += 1
 
-    # Explications détaillées (minimum 5 phrases par paramètre)
-    st.subheader("Explications détaillées des paramètres et du test")
+    # Explications pédagogiques des paramètres (au moins cinq phrases par paramètre)
+    st.subheader("Explications détaillées")
     st.markdown(
-        "La magnitude moyenne mesure l’intensité moyenne des déplacements estimés par le flux optique entre deux images consécutives. "
-        "Elle agrège les modules des vecteurs de mouvement sur l’ensemble des pixels, puis en prend la moyenne pour obtenir une valeur simple et robuste. "
-        "Lorsque cette magnitude est élevée sur un pas, cela signifie qu’une part importante de l’image a changé de position de manière notable. "
-        "Cette mesure est utile pour comparer l’activité visible d’un passage par rapport au comportement général de la vidéo. "
-        "Dans le cadre d’un timelapse où les mouvements sont saccadés, la magnitude moyenne reste pertinente car elle résume la variation apparente même si les intervalles temporels ne sont pas réguliers."
+        "Le pas d’analyse représente l’intervalle entre images successives utilisées pour le calcul du flux optique. "
+        "Un pas égal à un signifie que chaque image est utilisée et que l’on évalue les déplacements entre deux images consécutives. "
+        "Augmenter le pas revient à sauter des images intermédiaires, ce qui accélère l’analyse et accentue les variations apparentes entre deux états éloignés. "
+        "Cette approche est particulièrement utile lorsque les frames extraites proviennent déjà d’un timelapse, car l’espacement temporel réel est important. "
+        "Dans une vidéo classique, choisir un pas supérieur à un permet d’alléger la charge de calcul tout en conservant une sensibilité raisonnable aux changements visuels."
     )
     st.markdown(
-        "L’écart-type de la magnitude décrit la variabilité des vitesses de mouvement à l’intérieur d’un même pas. "
-        "Une valeur élevée indique que certaines zones se déplacent fortement tandis que d’autres bougent peu, ce qui traduit une hétérogénéité des gestes ou de la scène. "
-        "À l’inverse, un écart-type faible signale des mouvements plus homogènes, souvent associés à une action coordonnée ou à une stabilité visuelle. "
-        "Cette mesure complète naturellement la magnitude moyenne en révélant la dispersion interne des vitesses. "
-        "Elle est utile pour distinguer des pics localisés de mouvement de véritables changements globaux dans l’image."
+        "Le mode d’extraction « toutes les frames (timelapse/natif) » tente de conserver chaque image distincte produite par la vidéo source. "
+        "Cette option est adaptée aux timelapses et aux séquences à cadence variable, car elle respecte le rythme d’acquisition original. "
+        "Elle peut générer davantage d’images à traiter, offrant une granularité plus fine de l’analyse au prix d’un temps de calcul plus long. "
+        "La conversion en 1080p garantit une dimension cohérente pour le calcul du flux optique sans perdre trop d’information spatiale. "
+        "Lorsque la vidéo est très longue, il reste possible de combiner cette option avec un pas d’analyse supérieur à un pour maîtriser la complexité."
     )
     st.markdown(
-        "Le 95e percentile (P95) de la magnitude représente un seuil au-delà duquel se situent les vitesses les plus élevées observées sur un pas. "
-        "Il est moins sensible aux valeurs extrêmes isolées qu’un maximum brut, tout en capturant l’existence de mouvements rapides. "
-        "Une augmentation du P95 par rapport à la moyenne globale suggère la présence de micro-événements intenses, même si la scène reste globalement modérée. "
-        "Dans l’analyse comparative, un P95 plus élevé sur un passage signale des instants de mouvement rapide plus fréquents ou plus marqués. "
-        "Cette métrique aide à repérer des changements brusques qui ne suffisent pas à augmenter la moyenne mais qui restent significatifs."
+        "La cadence fixe définit un nombre d’images extraites par seconde indépendamment de la vidéo source. "
+        "Cette stratégie uniformise l’échantillonnage temporel, utile pour comparer plusieurs vidéos différentes avec la même résolution temporelle. "
+        "Elle réduit l’empreinte mémoire et le nombre de paires à analyser si la vidéo a un taux d’images natif élevé. "
+        "Elle peut, en revanche, lisser certains micro-événements présents entre deux extractions si la cadence choisie est trop faible. "
+        "Dans la pratique, une cadence modérée conjointe à un pas d’analyse ajusté permet un compromis entre fidélité et performance."
     )
     st.markdown(
-        "L’énergie du mouvement est la somme de toutes les magnitudes sur un pas, ce qui en fait un indicateur volumique du déplacement total. "
-        "Elle cumule l’intensité des vecteurs de tous les pixels et met en évidence les instants où l’activité globale est maximale. "
-        "Dans des vidéos longues, l’énergie permet de repérer des segments particulièrement dynamiques sans examiner image par image. "
-        "Cette mesure est proche de la magnitude moyenne mais pondère davantage les scènes couvrant de grandes surfaces en mouvement. "
-        "Combinée à la magnitude moyenne dans un score composite, elle renforce la stabilité de la détection d’événements inhabituels."
+        "La magnitude moyenne mesure l’intensité moyenne du déplacement des pixels entre deux images prises à l’intervalle défini. "
+        "Cette grandeur synthétise la quantité de mouvement visible, indépendamment de la direction des déplacements. "
+        "Elle est robuste au bruit local car elle agrège l’information sur l’ensemble de l’image. "
+        "Une augmentation nette de la magnitude moyenne signale un passage plus dynamique que la tendance générale. "
+        "Dans un timelapse, elle met en évidence les phases où la scène a le plus évolué d’un cliché au suivant."
     )
     st.markdown(
-        "La direction dominante correspond à l’orientation moyenne des vecteurs du flux optique, projetée sur le cercle trigonométrique. "
-        "Elle révèle si les mouvements tendent majoritairement vers une même direction, ce qui peut signaler un geste orienté ou un déplacement global de la scène. "
-        "Cette information est précieuse lorsqu’on étudie des comportements structurés, comme une personne qui se tourne ou un cadrage qui glisse. "
-        "Elle se complète par la dispersion, afin de ne pas sur-interpréter une moyenne de directions lorsque les mouvements sont contradictoires. "
-        "Dans une perspective d’analyse des interactions, une direction dominante stable peut caractériser des séquences de geste répétitif ou une posture dirigée."
+        "L’énergie du mouvement cumule toutes les magnitudes au sein d’un même pas, ce qui souligne les événements couvrant de larges portions de l’image. "
+        "Elle complète la magnitude moyenne en pondérant davantage les zones étendues en mouvement. "
+        "Dans les comparaisons, un pic d’énergie suggère une transformation globale de la scène plutôt qu’un simple détail local. "
+        "Utilisée avec la magnitude moyenne dans un score composite, elle stabilise la détection des passages inhabituels. "
+        "Cette combinaison réduit les faux positifs dus à de petites zones très rapides ou à des fluctuations locales."
     )
     st.markdown(
-        "La dispersion de direction mesure la concentration des orientations autour de la moyenne, via la longueur résultante normalisée des vecteurs unitaires. "
-        "Une dispersion faible indique des orientations cohérentes entre elles, tandis qu’une dispersion forte traduit de l’agitation ou des mouvements désordonnés. "
-        "Cette mesure aide à distinguer les passages où l’attention corporelle est focalisée de ceux où les déplacements sont erratiques. "
-        "Dans une analyse comparative, une dispersion plus faible sur un passage peut être associée à une tâche précise ou à une activité dirigée. "
-        "Inversement, une dispersion élevée peut coïncider avec des phases de transition, d’exploration ou de réorganisation de la scène."
-    )
-    st.markdown(
-        "Le score composite combine la magnitude moyenne et l’énergie du mouvement après standardisation, afin d’obtenir un indicateur synthétique et comparable. "
-        "La standardisation par z-score recentre chaque métrique autour de sa moyenne et la met à l’échelle de son écart-type, ce qui évite qu’une unité domine arbitrairement l’autre. "
-        "La moyenne des deux z-scores capture à la fois l’intensité typique et le volume global des mouvements sur chaque pas. "
-        "Ce score est ensuite comparé à un seuil fixe de déviation importante pour marquer les anomalies, ce qui rend la décision lisible et reproductible. "
-        "Cette construction stabilise la détection dans des contextes variés, y compris lorsque l’échantillonnage temporel provient d’un timelapse."
-    )
-    st.markdown(
-        "L’intervalle d’analyse optionnel permet de cibler automatiquement une portion de la vidéo sans intervention supplémentaire. "
-        "Lorsque l’intervalle est activé, la découpe est effectuée au moment de l’extraction d’images par FFmpeg, de sorte que seuls les pas pertinents sont calculés. "
-        "Cette approche est adaptée aux timelapses, où l’espacement entre images originales peut être important sans empêcher l’estimation du mouvement apparent. "
-        "Le choix d’un intervalle n’influence pas la définition des images ni la cadence d’extraction, qui demeurent constantes pour garantir la comparabilité. "
-        "En pratique, cette focalisation accélère l’analyse lorsque l’on souhaite étudier précisément un passage critique sans bruit contextuel."
+        "Le score composite est obtenu en standardisant la magnitude moyenne et l’énergie puis en prenant leur moyenne. "
+        "La standardisation par z-score ramène chaque métrique autour de zéro et l’exprime en écart-type, ce qui les rend comparables. "
+        "Un score composite élevé indique qu’au même pas, l’intensité moyenne et le volume total de mouvement dépassent notablement la moyenne globale. "
+        "Le seuil d’anomalie fixé à 2.5 écart-types isole les déviations marquées sans noyer l’utilisateur sous des alertes mineures. "
+        "Les vignettes correspondantes sont encadrées en rouge pour un repérage instantané dans la mosaïque."
     )
