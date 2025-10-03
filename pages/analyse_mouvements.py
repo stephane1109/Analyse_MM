@@ -1,7 +1,8 @@
 # pages/analyse_mouvements.py
 # Analyse des mouvements avec choix du pas d’analyse (intervalle entre frames analysées),
-# extraction "toutes les frames (timelapse/natif)" ou "cadence fixe (i/s)", et
-# visualisation des anomalies (encadrées en rouge) sur un APERÇU GLOBAL basé sur TOUTES les images extraites.
+# extraction "toutes les frames (timelapse/natif)" ou "cadence fixe (i/s)",
+# affichage garanti via PIL (Pillow) et anomalies encadrées en rouge.
+# Pipeline : FFmpeg -> JPG 1080p -> affichage PIL -> calculs flux optique (OpenCV) -> score composite -> anomalies.
 
 import math
 import shutil
@@ -41,7 +42,7 @@ def executer(cmd: List[str]) -> Tuple[bool, str]:
         return False, f"Erreur d'exécution : {e}"
 
 def importer_cv2():
-    """Import différé d'OpenCV (opencv-python-headless recommandé sur Streamlit Cloud)."""
+    """Import différé d'OpenCV (opencv-python-headless recommandé)."""
     try:
         import cv2  # type: ignore
         return cv2, None
@@ -84,44 +85,60 @@ def extraire_frames_1080p(
     return executer(cmd)
 
 # =============================
-# Chargement et utilitaires image
+# Chargement et affichage images (PIL)
 # =============================
 
-def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """Charge les images extraites en niveaux de gris et en RGB (pour vignettes)."""
+def charger_images_pil(dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray], List[Path]]:
+    """
+    Charge les images via PIL pour fiabiliser l'affichage Streamlit.
+    - rgbs_pil : liste d'images RGB (numpy uint8) pour affichage
+    - grays    : liste d'images grises (numpy uint8) pour calculs
+    - chemins  : fichiers correspondants
+    """
+    from PIL import Image
     fichiers = sorted(dossier.glob("frame_*.jpg"))
-    grays, rgbs = [], []
+    rgbs, grays = [], []
     for f in fichiers:
-        bgr = cv2.imread(str(f), cv2.IMREAD_COLOR)
-        if bgr is None:
+        try:
+            with Image.open(f) as im:
+                im = im.convert("RGB")
+                rgb = np.array(im)  # H x W x 3, uint8
+                gray = np.mean(rgb, axis=2).astype(np.uint8)  # simple luminance pour robustesse
+                rgbs.append(rgb)
+                grays.append(gray)
+        except Exception:
+            # On ignore l'image corrompue, mais on continue
             continue
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        grays.append(gray)
-        rgbs.append(rgb)
-    return grays, rgbs
+    return rgbs, grays, fichiers
 
-def encadrer_rouge(cv2, img_rgb: np.ndarray, epaisseur: int = 8) -> np.ndarray:
-    """Dessine un cadre rouge autour d'une image RGB pour signaler une anomalie."""
+def encadrer_rouge_pil(img_rgb: np.ndarray, epaisseur: int = 8) -> np.ndarray:
+    """Encadre une image RGB avec un cadre rouge (PIL-like, mais en numpy direct)."""
     vis = img_rgb.copy()
     h, w = vis.shape[:2]
-    cv2.rectangle(vis, (0, 0), (w-1, h-1), (255, 0, 0), thickness=epaisseur)
+    e = max(1, int(epaisseur))
+    vis[:e, :, :] = [255, 0, 0]
+    vis[-e:, :, :] = [255, 0, 0]
+    vis[:, :e, :] = [255, 0, 0]
+    vis[:, -e:, :] = [255, 0, 0]
     return vis
 
 # =============================
-# Flux optique + métriques
+# Flux optique + métriques (OpenCV)
 # =============================
 
-def farneback(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarray:
-    """Flux optique dense Farneback (retourne (H,W,2) vecteurs (dx,dy))."""
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray,
-        None,
-        pyr_scale=0.5, levels=3, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2,
-        flags=0
-    )
-    return flow
+def farneback(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> Optional[np.ndarray]:
+    """Flux optique dense Farneback (retourne (H,W,2) ou None en cas d'échec local)."""
+    try:
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, gray,
+            None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2,
+            flags=0
+        )
+        return flow
+    except Exception:
+        return None
 
 def stats_circulaires(flow: np.ndarray) -> Tuple[float, float]:
     """Direction dominante (degrés) et dispersion (1-R) des directions de mouvement."""
@@ -221,7 +238,7 @@ st.caption(
     "• **Pas d’analyse** : intervalle entre images utilisées pour le calcul (1,2,3...). "
     "En timelapse, mets 1 pour exploiter chaque image extraite. "
     "• **Mode d’extraction** : « frames natives » (toutes) ou « cadence fixe ». "
-    "Si tu ne vois que quelques vignettes, passe en *frames natives* ou augmente la cadence fixe."
+    "Si tu ne vois que peu de vignettes, passe en *frames natives* ou augmente la cadence fixe."
 )
 
 lancer = st.button("Analyser", type="primary")
@@ -240,31 +257,49 @@ if lancer:
             st.code(log_ext or "(vide)", language="bash")
         st.stop()
 
-    imgs_gray, imgs_rgb = charger_images_gris_et_rgb(cv2, frames_dir)
-    total_frames = len(imgs_gray)
+    # Chargement et APERÇU IMMÉDIAT (PIL)
+    imgs_rgb, imgs_gray, fichiers = charger_images_pil(frames_dir)
+    total_frames = len(imgs_rgb)
     if total_frames < 2:
-        st.error("Trop peu d’images extraites pour analyser.")
-        with st.expander("Journal FFmpeg"):
+        st.error("Trop peu d’images extraites pour analyser (ou échec de lecture des JPG).")
+        with st.expander("Diagnostic extraction"):
+            st.write(f"Dossier : {frames_dir}")
+            st.write(f"Fichiers JPG détectés : {len(list(frames_dir.glob('frame_*.jpg')))}")
             st.code(log_ext or "(vide)", language="bash")
         st.stop()
 
-    # Info explicative sur le nombre d'images extraites
-    mode_txt = "frames natives" if mode == "natifs" else f"cadence fixe = {int(fps_ech)} i/s"
-    st.info(f"Images extraites : {total_frames} ({mode_txt}). "
+    st.info(f"Images extraites : {total_frames} ({'frames natives' if mode=='natifs' else f'cadence fixe = {int(fps_ech)} i/s'}). "
             f"Si ce nombre est trop faible, choisis « frames natives » ou augmente la cadence fixe.")
 
-    # Sous-échantillonnage pour le pas d'analyse (1 = chaque image, 2 = une sur deux, etc.)
-    indices = list(range(0, total_frames, int(pas_analyse)))
-    if len(indices) < 2:
-        st.error("Le pas d’analyse est trop grand pour la longueur de la séquence.")
-        st.stop()
+    # Vignettes d’aperçu immédiat (toujours sur TOUTES les images extraites)
+    st.subheader("Aperçu immédiat des images extraites")
+    Nprev = len(imgs_rgb)
+    nb_prev = min(24, Nprev)
+    idx_prev = np.linspace(0, Nprev - 1, num=nb_prev, dtype=int)
+    cols = st.columns(6)
+    for i, idx in enumerate(idx_prev):
+        cols[i % 6].image(imgs_rgb[int(idx)], caption=f"frame #{int(idx)}", use_container_width=False)
 
-    # Calcul du flux optique et des métriques entre images espacées par le pas choisi
+    # Construction des indices pour le PAS D’ANALYSE
+    pas = int(pas_analyse)
+    indices = list(range(0, total_frames, pas))
+    if len(indices) < 2:
+        st.warning("Pas d’analyse trop grand pour la longueur de la séquence. Utilisation automatique de pas=1.")
+        pas = 1
+        indices = list(range(0, total_frames, pas))
+
+    # Calcul du flux optique et des métriques entre frames espacées par 'pas'
+    cv2, _ = importer_cv2()  # re-import au cas où
     lignes: List[Dict[str, float]] = []
+    echecs_pairs = 0
+
     for k in range(1, len(indices)):
         i_prev = indices[k-1]
         i_curr = indices[k]
         flow = farneback(cv2, imgs_gray[i_prev], imgs_gray[i_curr])
+        if flow is None:
+            echecs_pairs += 1
+            continue
         met = metriques_par_pas(flow)
         lignes.append({
             "etape": k,
@@ -277,6 +312,13 @@ if lancer:
             "direction_dominante_deg": met["direction_dominante_deg"],
             "dispersion_direction": met["dispersion_direction"],
         })
+
+    if not lignes:
+        st.error("Aucune paire valide pour le flux optique. Essaie pas=1 et « frames natives ».")
+        st.stop()
+
+    if echecs_pairs > 0:
+        st.warning(f"{echecs_pairs} paire(s) ont échoué au calcul du flux optique et ont été ignorées.")
 
     df = pd.DataFrame(lignes)
 
@@ -301,7 +343,7 @@ if lancer:
     nb_ano = int(df["anomalie"].sum())
     st.write(f"Nombre d’anomalies détectées : {nb_ano} (seuil z ≥ {seuil_z:.1f})")
 
-    # Vignettes des anomalies (top 16 par z décroissant), avec encadrement rouge
+    # Vignettes des anomalies (top 16 par z décroissant), avec encadrement rouge (via PIL)
     if nb_ano > 0:
         ord_ano = df[df["anomalie"]].sort_values("score_composite_z", ascending=False)
         top = ord_ano.head(16)
@@ -316,7 +358,7 @@ if lancer:
                 idx = int(row["frame_curr"])
                 z_here = float(row["score_composite_z"])
                 if 0 <= idx < len(imgs_rgb):
-                    vis = encadrer_rouge(cv2, imgs_rgb[idx], epaisseur=8)
+                    vis = encadrer_rouge_pil(imgs_rgb[idx], epaisseur=8)
                     c.image(vis, caption=f"frame #{idx} • z={z_here:.2f}", use_container_width=False)
                 k += 1
     else:
@@ -331,16 +373,13 @@ if lancer:
         mime="text/csv"
     )
 
-    # ======= APERÇU GLOBAL corrigé (sur TOUTES les images extraites) =======
+    # APERÇU GLOBAL sur TOUTES les images extraites (avec encadrement rouge si anomalie)
     st.subheader("Aperçu global (vignettes réparties, anomalies encadrées)")
-    # On base l’aperçu sur le nombre TOTAL d’images extraites (imgs_rgb), pas sur le nombre d’étapes analysées.
     N = len(imgs_rgb)
-    nb_vignettes = min(96, N)  # on monte à 96 pour mieux couvrir
+    nb_vignettes = min(96, N)
     idxs = np.linspace(0, N - 1, num=nb_vignettes, dtype=int)
 
-    # Pour savoir si une frame est marquée anomalie, on cherche si elle est un 'frame_curr' anormal
-    df_ano = df[df["anomalie"]]
-    frames_anormales = set(df_ano["frame_curr"].astype(int).tolist())
+    frames_anormales = set(df[df["anomalie"]]["frame_curr"].astype(int).tolist())
     z_map = {int(r["frame_curr"]): float(r["score_composite_z"]) for _, r in df.iterrows()}
 
     cols_par_ligne = 8
@@ -351,18 +390,14 @@ if lancer:
             if k >= len(idxs):
                 break
             fr = int(idxs[k])
-            img = encadrer_rouge(cv2, imgs_rgb[fr], epaisseur=6) if fr in frames_anormales else imgs_rgb[fr]
+            img = encadrer_rouge_pil(imgs_rgb[fr], epaisseur=6) if fr in frames_anormales else imgs_rgb[fr]
             z_here = z_map.get(fr, None)
             cap = f"frame #{fr}" + (f" • z={z_here:.2f}" if z_here is not None else "")
             c.image(img, caption=cap, use_container_width=False)
             k += 1
 
-    # Explications pédagogiques (rappel)
-    with st.expander("Pourquoi je ne vois que peu de vignettes parfois ?"):
-        st.markdown(
-            "- Si tu choisis **Cadence fixe** avec une petite valeur (ex. 1–4 i/s) et que la vidéo est courte, FFmpeg extraira peu d’images. "
-            "Passe en **Toutes les frames (timelapse/natif)** pour récupérer chaque image distincte.\n"
-            "- Le **pas d’analyse** n’affecte plus l’aperçu global : il n’influence que le calcul. "
-            "L’aperçu utilise désormais **toutes les images extraites**, donc augmente la cadence fixe ou change de mode si tu veux plus de vignettes.\n"
-            "- En timelapse, préfère **Toutes les frames** + **pas d’analyse = 1**."
-        )
+    # Diagnostic optionnel
+    with st.expander("Diagnostic (chemins et logs)"):
+        st.write(f"Dossier d'images : {frames_dir}")
+        st.write(f"Nombre de fichiers JPG : {len(list(frames_dir.glob('frame_*.jpg')))}")
+        st.code(log_ext or "(vide)", language="bash")
