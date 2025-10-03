@@ -1,14 +1,19 @@
 # pages/analyse_mouvements.py
-# Analyse visuelle avec deux modes :
-# 1) MAE (différence à l'image moyenne) pour anomalies globales de contenu.
-# 2) Flux optique (magnitude Farneback) pour indices/mesures de mouvement + heatmap + vecteurs.
-# Source prioritaire : MP4 uploadé. Fallback : vidéo préparée (st.session_state["video_base"]).
-# Extraction d'images en 1080p via FFmpeg, puis calculs avec OpenCV.
+# Analyse comparative des mouvements par flux optique (Farneback) avec métriques :
+# - Magnitude moyenne
+# - Direction dominante et dispersion (statistiques circulaires)
+# - Variance (écart-type) de la magnitude
+# - Histogramme de magnitude (lent / moyen / rapide)
+# - Ratio de frames "immobiles"
+# + Comparaison Segment d'intérêt vs Vidéo entière (différences et ratios)
+#
+# Source prioritaire : MP4 importé ici. Fallback : vidéo déjà préparée (st.session_state["video_base"]).
+# Extraction d'images en 1080p via FFmpeg, calculs avec OpenCV (opencv-python-headless).
 
 import math
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, List, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -16,16 +21,16 @@ import streamlit as st
 
 from core_media import initialiser_repertoires, info_ffmpeg
 
-# ----------------------------
+# =============================
 # Utilitaires système
-# ----------------------------
+# =============================
 
-def _ffmpeg_path() -> Optional[str]:
+def trouver_ffmpeg() -> Optional[str]:
     """Retourne le chemin de ffmpeg si disponible, sinon None."""
     p, _ = info_ffmpeg()
     return p
 
-def _run(cmd: List[str]) -> Tuple[bool, str]:
+def executer(cmd: List[str]) -> Tuple[bool, str]:
     """Exécute une commande système et retourne (ok, log)."""
     import subprocess
     try:
@@ -42,7 +47,7 @@ def _run(cmd: List[str]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Erreur d'exécution : {e}"
 
-def _load_cv2():
+def importer_cv2():
     """Import différé d'OpenCV (opencv-python-headless recommandé)."""
     try:
         import cv2  # type: ignore
@@ -50,12 +55,15 @@ def _load_cv2():
     except Exception as e:
         return None, f"OpenCV introuvable : {e}. Ajoute 'opencv-python-headless' dans requirements.txt."
 
-# ----------------------------
-# Extraction d'images via FFmpeg
-# ----------------------------
+# =============================
+# Extraction d'images (FFmpeg)
+# =============================
 
-def extraire_frames_ffmpeg(ff: str, video: Path, dossier: Path, fps_ech: int, largeur: int = 1920) -> Tuple[bool, str]:
-    """Extrait des images JPG uniformément, en 1080p (largeur 1920), à fps_ech images/s."""
+def extraire_frames_1080p(ffmpeg: str, video: Path, dossier: Path, fps_ech: int) -> Tuple[bool, str]:
+    """
+    Extrait des images JPG en 1080p (largeur 1920) à fps_ech images/s.
+    Les fichiers sont nommés frame_%06d.jpg.
+    """
     if dossier.exists():
         try:
             shutil.rmtree(dossier)
@@ -63,69 +71,32 @@ def extraire_frames_ffmpeg(ff: str, video: Path, dossier: Path, fps_ech: int, la
             pass
     dossier.mkdir(parents=True, exist_ok=True)
     motif = str(dossier / "frame_%06d.jpg")
-    filtre = f"fps={fps_ech},scale={largeur}:-2"
-    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf", filtre, "-q:v", "2", motif]
-    return _run(cmd)
+    filtre = f"fps={fps_ech},scale=1920:-2"
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf", filtre, "-q:v", "2", motif]
+    return executer(cmd)
 
-# ----------------------------
-# Chargement des images
-# ----------------------------
+# =============================
+# Chargement images
+# =============================
 
-def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """Charge toutes les images JPG en niveaux de gris et en RGB pour affichage."""
+def charger_images_gris(cv2, dossier: Path) -> List[np.ndarray]:
+    """Charge toutes les images JPG en niveaux de gris (liste)."""
     fichiers = sorted(dossier.glob("frame_*.jpg"))
-    grays, rgbs = [], []
+    images = []
     for f in fichiers:
         bgr = cv2.imread(str(f), cv2.IMREAD_COLOR)
         if bgr is None:
             continue
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        grays.append(gray)
-        rgbs.append(rgb)
-    return grays, rgbs
+        images.append(gray)
+    return images
 
-# ----------------------------
-# Mode 1 : MAE (différence à l'image moyenne)
-# ----------------------------
+# =============================
+# Flux optique + métriques
+# =============================
 
-def calculer_image_moyenne(imgs_gray: List[np.ndarray]) -> np.ndarray:
-    """Calcule l'image moyenne (float32) sur toutes les frames grises."""
-    acc = None
-    n = 0
-    for g in imgs_gray:
-        g32 = g.astype(np.float32)
-        if acc is None:
-            acc = g32
-        else:
-            acc += g32
-        n += 1
-    if acc is None or n == 0:
-        raise ValueError("Aucune image pour calculer la moyenne.")
-    return acc / float(n)
-
-def score_mae_par_frame(imgs_gray: List[np.ndarray], mean_img: np.ndarray) -> np.ndarray:
-    """Retourne, pour chaque frame, le MAE à l'image moyenne (moyenne des |diff| par pixel)."""
-    scores = []
-    for g in imgs_gray:
-        diff = np.abs(g.astype(np.float32) - mean_img)
-        mae = float(np.mean(diff))
-        scores.append(mae)
-    return np.array(scores, dtype=np.float32)
-
-def zscore(scores: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """Standardise les scores : z = (score - moyenne) / écart-type. Retourne (z, moyenne, std)."""
-    m = float(np.mean(scores))
-    s = float(np.std(scores)) if float(np.std(scores)) > 1e-12 else 1.0
-    z = (scores - m) / s
-    return z, m, s
-
-# ----------------------------
-# Mode 2 : Flux optique (Farneback)
-# ----------------------------
-
-def farneback_flow(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarray:
-    """Calcule le flux optique dense Farneback, retourne un tableau (H, W, 2) de vecteurs (dx, dy)."""
+def farneback(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarray:
+    """Flux optique dense Farneback (retourne un champ (H,W,2) de vecteurs (dx,dy))."""
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, gray,
         None,
@@ -135,76 +106,124 @@ def farneback_flow(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> np.ndarray:
     )
     return flow
 
-def metriques_flux_optique(flow: np.ndarray, seuil_pix: float) -> dict:
-    """Calcule les indices/métriques à partir du flux (magnitude)."""
-    mag = np.linalg.norm(flow, axis=2)
+def stats_circulaires(flow: np.ndarray) -> Tuple[float, float]:
+    """
+    Calcule la direction dominante (angle moyen en degrés) et la dispersion circulaire.
+    Méthode : on convertit (dx,dy) en angles theta = atan2(dy, dx), on moyenne sur le cercle.
+    - direction_dominante_deg : angle en degrés (-180,180]
+    - dispersion : 1 - R, avec R = longueur du vecteur résultant moyen (entre 0 et 1)
+      0 => directions très alignées (faible dispersion) ; 1 => directions très dispersées.
+    """
+    dx = flow[..., 0].astype(np.float32)
+    dy = flow[..., 1].astype(np.float32)
+    angle = np.arctan2(dy, dx)  # radians
+    # Vecteurs unitaires
+    ux = np.cos(angle)
+    uy = np.sin(angle)
+    R_x = float(np.mean(ux))
+    R_y = float(np.mean(uy))
+    R = float(np.sqrt(R_x**2 + R_y**2))
+    direction = float(np.degrees(np.arctan2(R_y, R_x)))  # degrés
+    dispersion = float(1.0 - R)
+    return direction, dispersion
+
+def histogramme_magnitude(mag: np.ndarray, bornes: List[float]) -> np.ndarray:
+    """Histogramme des magnitudes selon des bornes (en px/frame). Retourne les effectifs par bin."""
+    vals = mag.flatten().astype(np.float32)
+    hist, _ = np.histogram(vals, bins=np.array(bornes, dtype=np.float32))
+    return hist
+
+def metriques_par_pas(flow: np.ndarray, seuil_mobile: float, bornes_hist: List[float]) -> Dict[str, float]:
+    """
+    Calcule les métriques pour un pas (entre deux frames consécutives).
+    - magnitude moyenne
+    - écart-type magnitude
+    - p95 magnitude
+    - ratio de pixels "mobiles" (> seuil_mobile)
+    - énergie (somme des magnitudes)
+    - direction dominante (degrés) et dispersion
+    - histogramme (déployé en colonnes "h_bin_i")
+    """
+    mag = np.linalg.norm(flow, axis=2).astype(np.float32)
     m = float(np.mean(mag))
     s = float(np.std(mag))
     p95 = float(np.percentile(mag, 95))
-    ratio_mobile = float(np.mean(mag > seuil_pix))
+    ratio_mobile = float(np.mean(mag > seuil_mobile))
     energie = float(np.sum(mag))
-    return {
+    direction, dispersion = stats_circulaires(flow)
+    hist = histogramme_magnitude(mag, bornes_hist)
+
+    met = {
         "magnitude_moyenne": m,
         "magnitude_ecart_type": s,
         "magnitude_p95": p95,
         "ratio_pixels_mobiles": ratio_mobile,
         "energie_mouvement": energie,
+        "direction_dominante_deg": direction,
+        "dispersion_direction": dispersion,
     }
+    # Colonnes histogramme : h_bin_0 ... h_bin_{n-2} (si N bornes => N-1 bacs)
+    for i in range(len(bornes_hist) - 1):
+        met[f"h_bin_{i}"] = int(hist[i])
+    return met
 
-def heatmap_depuis_magnitude(cv2, mag: np.ndarray) -> np.ndarray:
-    """Crée une heatmap RGB à partir d'une magnitude (palette INFERNO, normalisation robuste)."""
-    m = mag.copy()
-    if not np.isfinite(m).all():
-        m[np.isnan(m)] = 0.0
-    vmax = np.percentile(m, 99) if np.any(m > 0) else 1.0
-    if vmax <= 0:
-        vmax = 1.0
-    norm = np.clip((m / vmax) * 255.0, 0, 255).astype(np.uint8)
-    hm_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
-    hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
-    return hm_rgb
+def agreger_sur_plage(df: pd.DataFrame, colonnes_hist: List[str]) -> Dict[str, float]:
+    """
+    Agrège les métriques sur une plage de pas (moyennes pour les stats, sommes pour l'histogramme).
+    Retourne un dict avec les mêmes clés que metriques_par_pas.
+    """
+    res = {}
+    # Moyennes des métriques scalaires
+    scalaires = [
+        "magnitude_moyenne", "magnitude_ecart_type", "magnitude_p95",
+        "ratio_pixels_mobiles", "energie_mouvement",
+        "direction_dominante_deg", "dispersion_direction",
+    ]
+    for k in scalaires:
+        if k in df:
+            res[k] = float(df[k].mean())
+    # Histogrammes : somme des effectifs
+    for h in colonnes_hist:
+        if h in df:
+            res[h] = int(df[h].sum())
+    return res
 
-def vecteurs_sur_image(cv2, frame_rgb: np.ndarray, flow: np.ndarray, pas: int = 16) -> np.ndarray:
-    """Dessine un champ de vecteurs échantillonné sur l'image RGB."""
-    h, w = frame_rgb.shape[:2]
-    vis = frame_rgb.copy()
-    for y in range(0, h, pas):
-        for x in range(0, w, pas):
-            fx, fy = flow[y, x]
-            x2 = int(round(x + fx))
-            y2 = int(round(y + fy))
-            cv2.arrowedLine(vis, (x, y), (x2, y2), (0, 255, 0), 1, tipLength=0.3)
-    return vis
-
-# ----------------------------
+# =============================
 # Page Streamlit
-# ----------------------------
+# =============================
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Analyse des mouvements et anomalies", layout="wide")
-st.title("Analyse des mouvements et anomalies")
+st.set_page_config(page_title="Analyse comparative des mouvements (flux optique)", layout="wide")
+st.title("Analyse comparative des mouvements (flux optique)")
 st.markdown("**www.codeandcortex.fr**")
 
-# Explications intégrées
 st.markdown(
-    "Deux modes complémentaires :\n"
-    "• **Différence à la moyenne (MAE)** : détecte des images globalement atypiques (flash, écran noir, scène très différente).\n"
-    "• **Flux optique (magnitude)** : mesure les déplacements entre images consécutives et fournit des **indices de mouvement** "
-    "(magnitude moyenne, écart-type, P95, ratio de pixels mobiles, énergie). Heatmap et vecteurs permettent de visualiser ce mouvement."
+    "L’outil calcule des **indices de mouvement** validés en vision par ordinateur, "
+    "et compare un **segment d’intérêt** à la **vidéo entière** :\n"
+    "- Magnitude moyenne du flux optique : activité globale (vitesse moyenne des mouvements).\n"
+    "- Direction dominante et dispersion : orientation moyenne des gestes et degré d’agitation.\n"
+    "- Variance (écart-type) de la magnitude : hétérogénéité des mouvements.\n"
+    "- Histogramme de magnitude : répartition des vitesses (lent / moyen / rapide).\n"
+    "- Ratio de frames immobiles : proportion de pas où la magnitude moyenne est faible.\n\n"
+    "Interprétation type en SHS : une magnitude moyenne plus basse dans un passage peut indiquer moins d’activité motrice, "
+    "souvent corrélée à une activité cognitive/métacognitive accrue (écoute, réflexion)."
 )
 
-ff = _ffmpeg_path()
+ff = trouver_ffmpeg()
 if not ff:
     st.error("FFmpeg introuvable. Fournis un binaire ./bin/ffmpeg ou vérifie /usr/bin/ffmpeg.")
     st.stop()
 
-cv2, cv_err = _load_cv2()
+cv2, cv_err = importer_cv2()
 if cv2 is None:
     st.error(cv_err)
     st.stop()
 
-# Source : upload prioritaire, sinon vidéo préparée
+# -----------------------------
+# Choix de la source
+# -----------------------------
+
 st.subheader("Source vidéo")
 source = st.radio("Choisir la source", ["Importer un MP4", "Utiliser la vidéo préparée"], index=0, horizontal=True)
 
@@ -227,196 +246,214 @@ else:
     else:
         st.warning("Aucune vidéo préparée en mémoire. Importez un MP4.")
 
-# Paramètres
+# -----------------------------
+# Paramètres (simples et explicites)
+# -----------------------------
+
 st.subheader("Paramètres")
-c0, c1, c2, c3 = st.columns(4)
-with c0:
-    mode = st.radio("Mode d'analyse", ["Différence à la moyenne (MAE)", "Flux optique (magnitude)"], index=1)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     fps_ech = st.number_input("Cadence extraction (images/s)", min_value=1, max_value=30, value=4, step=1)
 with c2:
-    nb_vignettes = st.number_input("Vignettes globales", min_value=12, max_value=200, value=48, step=12)
+    seuil_mobile = st.number_input("Seuil pixel mobile (px/frame)", min_value=0.1, max_value=10.0, value=1.5, step=0.1)
 with c3:
+    seuil_frame_immobile = st.number_input("Seuil frame immobile (magnitude moyenne)", min_value=0.0, max_value=5.0, value=0.2, step=0.05)
+with c4:
     montrer_log = st.checkbox("Afficher le journal FFmpeg", value=False)
 
-c4, c5 = st.columns(2)
-if mode.startswith("Différence"):
-    with c4:
-        sensibilite = st.selectbox("Sensibilité anomalies (seuil z-score)", ["Forte (z≥2.0)", "Normale (z≥2.5)", "Faible (z≥3.0)"], index=1)
-    seuil_z = 2.0 if sensibilite.startswith("Forte") else (2.5 if sensibilite.startswith("Normale") else 3.0)
-else:
-    with c4:
-        seuil_pix = st.number_input("Seuil pixel « mobile » (px/frame)", min_value=0.1, max_value=10.0, value=1.5, step=0.1)
-    with c5:
-        top_k = st.number_input("Nombre de frames les plus mobiles à illustrer", min_value=6, max_value=60, value=24, step=6)
+st.markdown(
+    "Histogramme de magnitude (px/frame) : bornes entre lesquelles on compte les vitesses. "
+    "Par défaut : [0, 0.5, 1, 2, 5, +∞)."
+)
+bornes_defaut = [0.0, 0.5, 1.0, 2.0, 5.0, 1e9]
+bornes_affiche = st.text_input("Bornes (séparées par des virgules)", value="0,0.5,1,2,5,1e9")
+try:
+    bornes_hist = [float(x.strip()) for x in bornes_affiche.split(",") if x.strip() != ""]
+    if len(bornes_hist) < 2:
+        bornes_hist = bornes_defaut
+except Exception:
+    bornes_hist = bornes_defaut
 
-lancer = st.button("Lancer l'analyse", type="primary")
+st.subheader("Segment d’intérêt")
+st.caption("Saisir le début et la fin en secondes (ils seront mappés sur les pas d’analyse à "
+           "la cadence d’extraction choisie).")
+c5, c6 = st.columns(2)
+with c5:
+    t_debut = st.number_input("Début (s)", min_value=0.0, value=0.0, step=0.5)
+with c6:
+    t_fin = st.number_input("Fin (s)", min_value=0.5, value=10.0, step=0.5)
+
+lancer = st.button("Calculer les métriques", type="primary")
+
+# -----------------------------
+# Calculs
+# -----------------------------
 
 if lancer:
     if video_path is None:
         st.error("Aucune source vidéo. Importez un MP4 ou sélectionnez la vidéo préparée.")
         st.stop()
 
-    # 1) Extraction d'images en 1080p
     frames_dir = (BASE_DIR / "frames_analysis" / video_path.stem).resolve()
-    ok_ext, log_ext = extraire_frames_ffmpeg(ff, video_path, frames_dir, int(fps_ech), largeur=1920)
+    ok_ext, log_ext = extraire_frames_1080p(ff, video_path, frames_dir, int(fps_ech))
     if not ok_ext:
         st.error("Échec extraction des images avec FFmpeg.")
         if montrer_log:
             st.code(log_ext or "(log vide)", language="bash")
         st.stop()
 
-    # 2) Chargement des images
-    imgs_gray, imgs_rgb = charger_images_gris_et_rgb(cv2, frames_dir)
-    if len(imgs_gray) < 2:
-        st.error("Aucune image ou trop peu d'images extraites. Impossible d'analyser.")
+    imgs = charger_images_gris(cv2, frames_dir)
+    if len(imgs) < 2:
+        st.error("Aucune image ou trop peu d’images extraites. Impossible d’analyser.")
         if montrer_log:
             st.code(log_ext or "(log vide)", language="bash")
         st.stop()
 
-    # 3) Mode MAE
-    if mode.startswith("Différence"):
-        mean_img = calculer_image_moyenne(imgs_gray)
-        scores_mae = score_mae_par_frame(imgs_gray, mean_img)
-        z, m_mae, s_mae = zscore(scores_mae)
-        anomalies_idx = np.where(z >= seuil_z)[0].tolist()
+    # Flux optique pour tous les pas
+    metriques_liste: List[Dict[str, float]] = []
+    for i in range(1, len(imgs)):
+        flow = farneback(cv2, imgs[i-1], imgs[i])
+        met = metriques_par_pas(flow, float(seuil_mobile), bornes_hist)
+        metriques_liste.append(met)
 
-        st.subheader("Résultats (MAE vs image moyenne)")
-        st.markdown(
-            f"MAE moyen : {m_mae:.2f}  |  Écart-type MAE : {s_mae:.2f}  |  Seuil d’anomalie z ≥ {seuil_z:.1f}\n\n"
-            "MAE (Mean Absolute Error) = moyenne des valeurs absolues de la différence pixel-à-pixel "
-            "entre l’image i et l’image moyenne de la séquence.\n"
-            "z-score = (MAE − moyenne_des_MAE) / écart-type_des_MAE. Un z élevé = image très atypique."
-        )
-        st.write(f"Images analysées : {len(imgs_gray)}  |  Anomalies détectées : {len(anomalies_idx)}")
+    # Table des pas
+    df = pd.DataFrame(metriques_liste)
+    df.insert(0, "pas_index", np.arange(1, len(metriques_liste) + 1))
+    df.insert(1, "temps_s_approx", df["pas_index"] / float(fps_ech))
 
-        # Export CSV
-        df = pd.DataFrame({
-            "index_frame": np.arange(len(scores_mae)),
-            "temps_s_approx": np.arange(len(scores_mae)) / float(fps_ech),
-            "mae_diff_moyenne": scores_mae,
-            "zscore_mae": z,
-            "anomalie": (z >= seuil_z),
-        })
-        st.download_button("Télécharger les scores (CSV)", data=df.to_csv(index=False).encode("utf-8"),
-                           file_name="scores_anomalies_mae.csv", mime="text/csv")
+    # Ratio de frames "immobiles" (magnitude moyenne < seuil_frame_immobile)
+    ratio_frames_immobiles_global = float(np.mean(df["magnitude_moyenne"] < float(seuil_frame_immobile)))
 
-        # Vignettes anormales triées
-        st.subheader("Vignettes anormales (si présentes)")
-        if anomalies_idx:
-            anomalies_sorted = sorted(anomalies_idx, key=lambda i: float(z[i]), reverse=True)
-            to_show = anomalies_sorted[:32]
-            cols_par_ligne = 8
-            lignes_nb = math.ceil(len(to_show) / cols_par_ligne)
-            k = 0
-            for _ in range(lignes_nb):
-                cols = st.columns(cols_par_ligne)
-                for c in cols:
-                    if k >= len(to_show):
-                        break
-                    i = int(to_show[k])
-                    c.image(imgs_rgb[i], caption=f"#{i} • z={z[i]:.2f}", use_container_width=False)
-                    k += 1
-        else:
-            st.info("Aucune frame n’a dépassé le seuil d’anomalie.")
+    # Définition segment (bornage dans la table des pas)
+    t_debut = max(0.0, float(t_debut))
+    t_fin = max(t_debut + 1.0 / float(fps_ech), float(t_fin))
+    df_segment = df[(df["temps_s_approx"] >= t_debut) & (df["temps_s_approx"] <= t_fin)].copy()
+    if df_segment.empty:
+        st.warning("Le segment ne contient aucun pas (vérifie début/fin et la cadence d’extraction).")
+        st.stop()
+    ratio_frames_immobiles_segment = float(np.mean(df_segment["magnitude_moyenne"] < float(seuil_frame_immobile)))
 
-    # 4) Mode Flux optique
-    else:
-        st.subheader("Résultats (flux optique Farneback)")
-        # Calcul des métriques par pas
-        metriques_liste = []
-        energies = []
-        mags_for_heat = []   # stocker quelques magnitudes pour heatmap
-        flows_for_vec = []   # stocker quelques flows pour vecteurs (échantillonnage léger)
+    # Colonnes histogramme pour agrégation
+    colonnes_hist = [c for c in df.columns if c.startswith("h_bin_")]
 
-        for i in range(1, len(imgs_gray)):
-            flow = farneback_flow(cv2, imgs_gray[i-1], imgs_gray[i])
-            met = metriques_flux_optique(flow, float(seuil_pix))
-            metriques_liste.append(met)
-            energies.append(met["energie_mouvement"])
-            if i % max(1, len(imgs_gray)//min(len(imgs_gray), 60)) == 0:
-                mag = np.linalg.norm(flow, axis=2)
-                mags_for_heat.append((i, mag))
-                flows_for_vec.append((i, flow))
+    # Agrégations
+    global_agg = agreger_sur_plage(df, colonnes_hist)
+    segment_agg = agreger_sur_plage(df_segment, colonnes_hist)
 
-        energies = np.array(energies, dtype=float)
-        mE = float(np.mean(energies))
-        sE = float(np.std(energies))
-        p95E = float(np.percentile(energies, 95)) if len(energies) else 0.0
+    # Ajout des ratios "frames immobiles"
+    global_agg["ratio_frames_immobiles"] = ratio_frames_immobiles_global
+    segment_agg["ratio_frames_immobiles"] = ratio_frames_immobiles_segment
 
-        st.markdown(
-            "Définitions des indices de mouvement :\n"
-            "- **Magnitude moyenne** : intensité moyenne du déplacement par pixel entre deux images.\n"
-            "- **Écart-type de la magnitude** : variabilité du mouvement.\n"
-            "- **P95 de la magnitude** : niveau de « pic » de mouvement.\n"
-            "- **Ratio de pixels mobiles** : part des pixels dont la magnitude dépasse le seuil choisi.\n"
-            "- **Énergie du mouvement** : somme des magnitudes (mesure globale par pas)."
-        )
-        st.write(f"Énergie moyenne : {mE:.2f}  |  Écart-type énergie : {sE:.2f}  |  P95 énergie : {p95E:.2f}")
+    # Comparaisons segment vs global (différences et ratios)
+    def diff_ratio(seg_val: float, glob_val: float) -> Tuple[float, float]:
+        r = float(seg_val) / float(glob_val) if abs(glob_val) > 1e-12 else float("inf")
+        d = float(seg_val) - float(glob_val)
+        return d, r
 
-        # Export CSV des métriques par pas
-        df = pd.DataFrame(metriques_liste)
-        df.insert(0, "pas_index", np.arange(1, len(metriques_liste)+1))
-        df.insert(1, "temps_s_approx", df["pas_index"] / float(fps_ech))
-        st.download_button("Télécharger les indices (CSV)", data=df.to_csv(index=False).encode("utf-8"),
-                           file_name="indices_flux_optique.csv", mime="text/csv")
+    lignes_comp = []
+    cles_comparees = [
+        "magnitude_moyenne",
+        "magnitude_ecart_type",
+        "magnitude_p95",
+        "ratio_pixels_mobiles",
+        "energie_mouvement",
+        "direction_dominante_deg",
+        "dispersion_direction",
+        "ratio_frames_immobiles",
+    ]
+    for k in cles_comparees:
+        if k in segment_agg and k in global_agg:
+            d, r = diff_ratio(segment_agg[k], global_agg[k])
+            lignes_comp.append({
+                "metrique": k,
+                "global": global_agg[k],
+                "segment": segment_agg[k],
+                "diff_segment_moins_global": d,
+                "ratio_segment_sur_global": r
+            })
+    df_comp = pd.DataFrame(lignes_comp)
 
-        # Sélection des frames les plus « mobiles » par énergie
-        if len(energies):
-            ordre = np.argsort(-energies)  # décroissant
-            top = ordre[:int(top_k)]
-            st.subheader("Vignettes des frames les plus mobiles (heatmap et vecteurs)")
-            cols_par_ligne = 6
-            k = 0
-            # Heatmaps
-            st.markdown("Heatmap de la magnitude (couleurs proportionnelles à l'intensité du mouvement)")
-            for _ in range(math.ceil(len(top) / cols_par_ligne)):
-                cols = st.columns(cols_par_ligne)
-                for c in cols:
-                    if k >= len(top):
-                        break
-                    idx = int(top[k])
-                    # flow/mag correspond au pas entre frame idx-1 -> idx
-                    # on affiche la frame idx en fond
-                    flow = farneback_flow(cv2, imgs_gray[idx-1], imgs_gray[idx])
-                    mag = np.linalg.norm(flow, axis=2)
-                    hm = heatmap_depuis_magnitude(cv2, mag)
-                    c.image(hm, caption=f"pas #{idx} • énergie={energies[idx-1]:.0f}", use_container_width=False)
-                    k += 1
+    # Histogrammes : on rapporte les effectifs et, pour lecture, les pourcentages (normalisés)
+    def hist_df(d: Dict[str, float]) -> pd.DataFrame:
+        vals = []
+        total = sum(int(d[h]) for h in colonnes_hist if h in d)
+        for i, h in enumerate(colonnes_hist):
+            v = int(d.get(h, 0))
+            borne_g = bornes_hist[i]
+            borne_d = bornes_hist[i+1]
+            etiquette = f"[{borne_g}, {borne_d})"
+            pourcent = (100.0 * v / total) if total > 0 else 0.0
+            vals.append({"bin": etiquette, "effectif": v, "pourcent": pourcent})
+        return pd.DataFrame(vals)
 
-            # Vecteurs
-            st.markdown("Champ de vecteurs (échantillonné)")
-            k = 0
-            for _ in range(math.ceil(len(top) / cols_par_ligne)):
-                cols = st.columns(cols_par_ligne)
-                for c in cols:
-                    if k >= len(top):
-                        break
-                    idx = int(top[k])
-                    flow = farneback_flow(cv2, imgs_gray[idx-1], imgs_gray[idx])
-                    vis = vecteurs_sur_image(cv2, imgs_rgb[idx], flow, pas=16)
-                    c.image(vis, caption=f"pas #{idx} • énergie={energies[idx-1]:.0f}", use_container_width=False)
-                    k += 1
-        else:
-            st.info("Impossible de calculer l’ordre des frames les plus mobiles (énergie vide).")
+    df_hist_global = hist_df(global_agg)
+    df_hist_segment = hist_df(segment_agg)
 
-    # 5) Aperçu global réparti (quel que soit le mode)
-    st.subheader("Aperçu global (vignettes réparties sur la vidéo)")
-    N = len(imgs_rgb)
-    idxs = np.linspace(0, N - 1, num=int(nb_vignettes), dtype=int)
-    cols_par_ligne = 8
-    lignes_nb = math.ceil(len(idxs) / cols_par_ligne)
-    k = 0
-    for _ in range(lignes_nb):
-        cols = st.columns(cols_par_ligne)
-        for c in cols:
-            if k >= len(idxs):
-                break
-            i = int(idxs[k])
-            c.image(imgs_rgb[i], caption=f"#{i}", use_container_width=False)
-            k += 1
+    # =========================
+    # Rendus dans Streamlit
+    # =========================
 
-    # 6) Journal FFmpeg optionnel
+    st.subheader("Résumés numériques")
+    colG, colS = st.columns(2)
+    with colG:
+        st.markdown("**Moyennes globales (toute la vidéo)**")
+        st.dataframe(pd.DataFrame([global_agg]).T.rename(columns={0: "valeur"}))
+    with colS:
+        st.markdown(f"**Moyennes sur le segment**  (de {t_debut:.1f}s à {t_fin:.1f}s)")
+        st.dataframe(pd.DataFrame([segment_agg]).T.rename(columns={0: "valeur"}))
+
+    st.subheader("Comparaison Segment vs Global")
+    st.caption("Différence = segment − global ; Ratio = segment / global.")
+    st.dataframe(df_comp)
+
+    st.subheader("Histogrammes de magnitude")
+    cHG, cHS = st.columns(2)
+    with cHG:
+        st.markdown("**Global**")
+        st.dataframe(df_hist_global)
+        st.bar_chart(df_hist_global.set_index("bin")["pourcent"])
+    with cHS:
+        st.markdown("**Segment**")
+        st.dataframe(df_hist_segment)
+        st.bar_chart(df_hist_segment.set_index("bin")["pourcent"])
+
+    st.subheader("Téléchargements")
+    st.download_button(
+        "Exporter les pas (indices par pas) en CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="indices_par_pas.csv",
+        mime="text/csv"
+    )
+    st.download_button(
+        "Exporter le résumé global en CSV",
+        data=pd.DataFrame([global_agg]).to_csv(index=False).encode("utf-8"),
+        file_name="resume_global.csv",
+        mime="text/csv"
+    )
+    st.download_button(
+        "Exporter le résumé segment en CSV",
+        data=pd.DataFrame([segment_agg]).to_csv(index=False).encode("utf-8"),
+        file_name="resume_segment.csv",
+        mime="text/csv"
+    )
+    st.download_button(
+        "Exporter la comparaison segment vs global en CSV",
+        data=df_comp.to_csv(index=False).encode("utf-8"),
+        file_name="comparaison_segment_vs_global.csv",
+        mime="text/csv"
+    )
+
     if montrer_log:
         with st.expander("Journal FFmpeg"):
             st.code(log_ext or "(log vide)", language="bash")
+
+    # Notes pédagogiques affichées dans la page
+    st.subheader("Notes d’interprétation (sciences humaines)")
+    st.markdown(
+        "- **Magnitude moyenne** plus basse dans le segment : activité motrice moindre, possiblement liée à une activité "
+        "cognitive/métacognitive plus forte (écoute, réflexion).\n"
+        "- **Direction dominante stable** et **faible dispersion** : gestes orientés, posture dirigée (ex. prise de parole cadrée).\n"
+        "- **Variance** faible : mouvements plus homogènes, pouvant refléter une concentration accrue.\n"
+        "- **Histogramme** décalé vers les basses vitesses : phase calme ; vers les hautes : phase dynamique.\n"
+        "- **Frames immobiles** nombreuses : immobilité (écoute, attention)."
+    )
