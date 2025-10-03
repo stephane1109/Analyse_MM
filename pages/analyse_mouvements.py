@@ -1,28 +1,32 @@
 # pages/analyse_mouvements.py
-# Analyse de mouvement : upload prioritaire, fallback sur la vidéo préparée.
-# Pas d'import externe "opticalflow" : toutes les fonctions (serie_magnitude, lire_frame_a,
-# farneback_pair, heatmap, vectors_overlay) sont définies ici.
-# Pipeline robuste : FFmpeg -> JPG -> OpenCV Farneback -> métriques + vignettes.
+# Analyse d'anomalies visuelles par différence à l'image moyenne, avec explications intégrées.
+# Source prioritaire : MP4 importé sur cette page. Fallback : vidéo préparée (st.session_state["video_base"]).
+# Extraction d'images en 1080p via FFmpeg, analyse à cadence réglable (4 i/s par défaut).
+# Détection : score MAE par frame (écart moyen absolu à l'image moyenne), standardisé en z-score.
+# Anomalie si z-score >= seuil (sensibilité choisie).
 
 import math
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, List, Optional
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 
 from core_media import initialiser_repertoires, info_ffmpeg
 
-# =========================
-# Outillage système
-# =========================
+# ----------------------------
+# Utilitaires système
+# ----------------------------
 
 def _ffmpeg_path() -> Optional[str]:
+    """Retourne le chemin de ffmpeg si disponible, sinon None."""
     p, _ = info_ffmpeg()
     return p
 
 def _run(cmd: List[str]) -> Tuple[bool, str]:
+    """Exécute une commande système et retourne (ok, log)."""
     import subprocess
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -39,83 +43,19 @@ def _run(cmd: List[str]) -> Tuple[bool, str]:
         return False, f"Erreur d'exécution : {e}"
 
 def _load_cv2():
+    """Import différé d'OpenCV (opencv-python-headless recommandé)."""
     try:
         import cv2  # type: ignore
         return cv2, None
     except Exception as e:
         return None, f"OpenCV introuvable : {e}. Ajoute 'opencv-python-headless' dans requirements.txt."
 
-# =========================
-# Fonctions "opticalflow" intégrées
-# =========================
+# ----------------------------
+# Extraction d'images
+# ----------------------------
 
-def lire_frame_a(cv2, chemin: Path):
-    """Lit une image disque en BGR et retourne (ok, bgr)."""
-    arr = cv2.imread(str(chemin), cv2.IMREAD_COLOR)
-    if arr is None:
-        return False, None
-    return True, arr
-
-def farneback_pair(cv2, prev_gray: np.ndarray, gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Flux optique Farneback entre deux images grises. Retourne (flow, magnitude)."""
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray,
-        None,
-        pyr_scale=0.5, levels=3, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2,
-        flags=0
-    )
-    mag = np.linalg.norm(flow, axis=2)
-    return flow, mag
-
-def heatmap(cv2, mag: np.ndarray) -> np.ndarray:
-    """Génère une heatmap RGB à partir d'une magnitude."""
-    m = mag.copy()
-    if not np.isfinite(m).all():
-        m[np.isnan(m)] = 0.0
-    vmax = np.percentile(m, 99) if np.any(m > 0) else 1.0
-    if vmax <= 0:
-        vmax = 1.0
-    norm = np.clip((m / vmax) * 255.0, 0, 255).astype(np.uint8)
-    hm_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
-    hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
-    return hm_rgb
-
-def vectors_overlay(cv2, frame_rgb: np.ndarray, flow: np.ndarray, step: int = 16) -> np.ndarray:
-    """Trace un champ de vecteurs échantillonné sur l'image RGB."""
-    h, w = frame_rgb.shape[:2]
-    overlay = frame_rgb.copy()
-    for y in range(0, h, step):
-        for x in range(0, w, step):
-            fx, fy = flow[y, x]
-            x2 = int(round(x + fx))
-            y2 = int(round(y + fy))
-            cv2.arrowedLine(overlay, (x, y), (x2, y2), (0, 255, 0), 1, tipLength=0.3)
-    return overlay
-
-def serie_magnitude(cv2, images_gray: List[np.ndarray], seuil_pix: float):
-    """Calcule, pour une série d'images grises, les métriques par pas et l'énergie."""
-    metriques = []
-    energies = []
-    for i in range(1, len(images_gray)):
-        flow, mag = farneback_pair(cv2, images_gray[i-1], images_gray[i])
-        m = {
-            "magnitude_moyenne": float(np.mean(mag)),
-            "magnitude_ecart_type": float(np.std(mag)),
-            "magnitude_p95": float(np.percentile(mag, 95)),
-            "ratio_pixels_mobiles": float(np.mean(mag > seuil_pix)),
-            "energie_mouvement": float(np.sum(mag)),
-        }
-        metriques.append(m)
-        energies.append(m["energie_mouvement"])
-    return metriques, np.array(energies, dtype=float)
-
-# =========================
-# Extraction et chargement des frames
-# =========================
-
-def extraire_frames_ffmpeg(ff: str, video: Path, dossier: Path, fps_ech: float, largeur: int) -> Tuple[bool, str]:
-    """Extrait des JPG à cadence régulière, redimensionnés pour l'analyse."""
+def extraire_frames_ffmpeg(ff: str, video: Path, dossier: Path, fps_ech: int, largeur: int = 1920) -> Tuple[bool, str]:
+    """Extrait des images JPG uniformément, en 1080p (largeur 1920), à fps_ech images/s."""
     if dossier.exists():
         try:
             shutil.rmtree(dossier)
@@ -127,29 +67,91 @@ def extraire_frames_ffmpeg(ff: str, video: Path, dossier: Path, fps_ech: float, 
     cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf", filtre, "-q:v", "2", motif]
     return _run(cmd)
 
-def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray], List[Path]]:
-    """Charge les images JPG en gris et en RGB, retourne aussi la liste des chemins."""
+# ----------------------------
+# Chargement des images
+# ----------------------------
+
+def charger_images_gris_et_rgb(cv2, dossier: Path) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Charge toutes les images JPG en niveaux de gris et en RGB pour affichage."""
     fichiers = sorted(dossier.glob("frame_*.jpg"))
     grays, rgbs = [], []
     for f in fichiers:
-        ok, bgr = lire_frame_a(cv2, f)
-        if not ok:
+        bgr = cv2.imread(str(f), cv2.IMREAD_COLOR)
+        if bgr is None:
             continue
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         grays.append(gray)
         rgbs.append(rgb)
-    return grays, rgbs, fichiers
+    return grays, rgbs
 
-# =========================
+# ----------------------------
+# Anomalie = différence à l'image moyenne
+# ----------------------------
+
+def calculer_image_moyenne(imgs_gray: List[np.ndarray]) -> np.ndarray:
+    """Calcule l'image moyenne (float32) sur toutes les frames grises."""
+    acc = None
+    n = 0
+    for g in imgs_gray:
+        g32 = g.astype(np.float32)
+        if acc is None:
+            acc = g32
+        else:
+            acc += g32
+        n += 1
+    if acc is None or n == 0:
+        raise ValueError("Aucune image pour calculer la moyenne.")
+    return acc / float(n)
+
+def score_mae_par_frame(imgs_gray: List[np.ndarray], mean_img: np.ndarray) -> np.ndarray:
+    """Retourne, pour chaque frame, le MAE à l'image moyenne (moyenne des |diff| par pixel)."""
+    scores = []
+    for g in imgs_gray:
+        diff = np.abs(g.astype(np.float32) - mean_img)
+        mae = float(np.mean(diff))
+        scores.append(mae)
+    return np.array(scores, dtype=np.float32)
+
+def zscore(scores: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    """Standardise les scores : z = (score - moyenne) / écart-type. Retourne (z, moyenne, std)."""
+    m = float(np.mean(scores))
+    s = float(np.std(scores)) if float(np.std(scores)) > 1e-12 else 1.0
+    z = (scores - m) / s
+    return z, m, s
+
+# ----------------------------
 # Page Streamlit
-# =========================
+# ----------------------------
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Analyse des mouvements (flux optique)", layout="wide")
-st.title("Analyse des mouvements (flux optique)")
+st.set_page_config(page_title="Analyse d'anomalies (différence à la moyenne)", layout="wide")
+st.title("Analyse d'anomalies (différence à la moyenne)")
 st.markdown("**www.codeandcortex.fr**")
+
+# Explications intégrées
+st.markdown(
+    "Cette analyse détecte des images « atypiques » en comparant chaque image à l'image moyenne "
+    "calculée sur toute la séquence. Pour chaque image i, on mesure l'écart moyen absolu (MAE) entre i et la moyenne. "
+    "Ces scores sont ensuite standardisés en z-score. Une image est dite « anormale » si son z-score dépasse un seuil."
+)
+
+with st.expander("Pourquoi 4 images/seconde par défaut ?"):
+    st.markdown(
+        "Le choix par défaut de 4 images/s équilibre vitesse et pertinence : assez d'images pour repérer des changements "
+        "visibles, sans saturer la mémoire ni ralentir l'application. Tu peux augmenter si la vidéo change très vite, "
+        "ou diminuer si elle est longue et assez statique."
+    )
+
+with st.expander("Définitions affichées dans la page"):
+    st.markdown(
+        "MAE (Mean Absolute Error) : moyenne des valeurs absolues de la différence pixel à pixel entre une image et "
+        "l'image moyenne. Plus le MAE est grand, plus l'image s'éloigne du contenu moyen.\n\n"
+        "z-score : normalisation des scores pour les rendre comparables. "
+        "z = (score − moyenne_des_scores) / écart_type_des_scores. "
+        "Un z-score élevé signifie que la frame est très différente des autres."
+    )
 
 ff = _ffmpeg_path()
 if not ff:
@@ -161,7 +163,8 @@ if cv2 is None:
     st.error(cv_err)
     st.stop()
 
-st.subheader("Source de la vidéo")
+# Source : upload prioritaire, sinon vidéo préparée
+st.subheader("Source vidéo pour l'analyse")
 source = st.radio("Choisir la source", ["Importer un MP4", "Utiliser la vidéo préparée"], index=0, horizontal=True)
 
 video_path: Optional[Path] = None
@@ -183,122 +186,115 @@ else:
     else:
         st.warning("Aucune vidéo préparée en mémoire. Importez un MP4.")
 
+# Paramètres simplifiés
 st.subheader("Paramètres")
 c1, c2, c3 = st.columns(3)
 with c1:
-    fps_ech = st.number_input("Cadence d’échantillonnage (images/s)", min_value=1, max_value=30, value=5, step=1)
+    fps_ech = st.number_input("Cadence d'échantillonnage (images/s)", min_value=1, max_value=30, value=4, step=1)
 with c2:
-    largeur_det = st.selectbox("Largeur d’analyse (px)", [480, 640, 960], index=1)
+    sensibilite = st.selectbox("Sensibilité des anomalies", ["Faible", "Normale", "Forte"], index=1)
 with c3:
-    seuil_pix = st.number_input("Seuil pixel 'mobile' (px/frame)", min_value=0.1, max_value=10.0, value=1.5, step=0.1)
+    nb_vignettes = st.number_input("Nombre de vignettes globales", min_value=12, max_value=200, value=48, step=12)
 
-c4, c5, c6 = st.columns(3)
-with c4:
-    nb_vignettes = st.number_input("Nombre de vignettes", min_value=8, max_value=200, value=40, step=4)
-with c5:
-    mode_vignettes = st.selectbox("Style vignette", ["RGB", "Heatmap", "Vecteurs"], index=0)
-with c6:
-    afficher_log = st.checkbox("Afficher le journal FFmpeg", value=False)
+seuils = {"Forte": 2.0, "Normale": 2.5, "Faible": 3.0}
+seuil_z = seuils[sensibilite]
 
-if st.button("Lancer l’analyse", type="primary"):
+montrer_log = st.checkbox("Afficher le journal FFmpeg", value=False)
+lancer = st.button("Lancer l'analyse", type="primary")
+
+if lancer:
     if video_path is None:
         st.error("Aucune source vidéo. Importez un MP4 ou sélectionnez la vidéo préparée.")
         st.stop()
 
+    # 1) Extraction d'images en 1080p à fps_ech
     frames_dir = (BASE_DIR / "frames_analysis" / video_path.stem).resolve()
-    ok_ext, log_ext = extraire_frames_ffmpeg(ff, video_path, frames_dir, float(fps_ech), int(largeur_det))
+    ok_ext, log_ext = extraire_frames_ffmpeg(ff, video_path, frames_dir, int(fps_ech), largeur=1920)
     if not ok_ext:
         st.error("Échec extraction des images avec FFmpeg.")
-        if afficher_log:
+        if montrer_log:
             st.code(log_ext or "(log vide)", language="bash")
         st.stop()
 
-    imgs_gray, imgs_rgb, chemins = charger_images_gris_et_rgb(cv2, frames_dir)
+    # 2) Chargement
+    imgs_gray, imgs_rgb = charger_images_gris_et_rgb(cv2, frames_dir)
     if len(imgs_gray) < 2:
-        st.error("Trop peu d’images extraites. La page resterait noire.")
-        if afficher_log:
+        st.error("Aucune image ou trop peu d'images extraites. Impossible d'analyser.")
+        if montrer_log:
             st.code(log_ext or "(log vide)", language="bash")
         st.stop()
 
-    metriques, energies = serie_magnitude(cv2, imgs_gray, float(seuil_pix))
-    moy = float(np.mean(energies))
-    std = float(np.std(energies))
-    seuil_pic = moy + 2.0 * std
-    pics_idx = [i+1 for i, e in enumerate(energies) if e >= seuil_pic]
+    # 3) Image moyenne et MAE par frame
+    mean_img = calculer_image_moyenne(imgs_gray)
+    scores_mae = score_mae_par_frame(imgs_gray, mean_img)
+    z, m_mae, s_mae = zscore(scores_mae)
 
-    st.subheader("Métriques globales")
-    st.write(f"Énergie moyenne : {moy:.2f}")
-    st.write(f"Écart-type : {std:.2f}")
-    st.write(f"Seuil de pic (moy + 2σ) : {seuil_pic:.2f}")
-    if pics_idx:
-        temps_pics = [idx / float(fps_ech) for idx in pics_idx]
-        st.write("Pics détectés : " + ", ".join([f"t≈{t:.1f}s (#{idx})" for t, idx in zip(temps_pics, pics_idx)]))
-    else:
-        st.write("Aucun pic détecté au seuil courant.")
+    # 4) Détection d'anomalies
+    anomalies_idx = np.where(z >= seuil_z)[0].tolist()
 
-    import pandas as pd
+    # 5) Résultats chiffrés et explications
+    st.subheader("Résultats et définitions")
+    st.markdown(
+        f"MAE moyen : {m_mae:.2f}  |  Écart-type MAE : {s_mae:.2f}  |  Seuil d’anomalie z ≥ {seuil_z:.1f}\n\n"
+        "Une frame est marquée « anomalie » si son z-score dépasse le seuil. "
+        "Cela signifie qu’elle diffère fortement de l’image moyenne relativement aux autres frames."
+    )
+    st.write(f"Nombre d’images analysées : {len(imgs_gray)}  |  Anomalies détectées : {len(anomalies_idx)}")
+
+    # 6) Export CSV
     lignes = []
-    for i, m in enumerate(metriques, start=1):
+    for i, (s, zi) in enumerate(zip(scores_mae, z)):
         lignes.append({
-            "index_sequence": i,
+            "index_frame": i,
             "temps_s_approx": i / float(fps_ech),
-            "magnitude_moyenne": m["magnitude_moyenne"],
-            "magnitude_ecart_type": m["magnitude_ecart_type"],
-            "magnitude_p95": m["magnitude_p95"],
-            "ratio_pixels_mobiles": m["ratio_pixels_mobiles"],
-            "energie_mouvement": m["energie_mouvement"],
+            "mae_diff_moyenne": float(s),
+            "zscore_mae": float(zi),
+            "anomalie": bool(zi >= seuil_z),
         })
     df = pd.DataFrame(lignes)
-    st.download_button("Télécharger les métriques (CSV)", data=df.to_csv(index=False).encode("utf-8"),
-                       file_name="metriques_flux_optique.csv", mime="text/csv")
+    st.download_button(
+        "Télécharger les scores (CSV)",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="scores_anomalies_diff_moyenne.csv",
+        mime="text/csv"
+    )
 
-    st.subheader("Vignettes réparties sur la vidéo")
+    # 7) Vignettes anormales (triées)
+    st.subheader("Vignettes anormales (si présentes)")
+    if anomalies_idx:
+        anomalies_sorted = sorted(anomalies_idx, key=lambda i: float(z[i]), reverse=True)
+        to_show = anomalies_sorted[:32]
+        cols_par_ligne = 8
+        lignes_nb = math.ceil(len(to_show) / cols_par_ligne)
+        k = 0
+        for _ in range(lignes_nb):
+            cols = st.columns(cols_par_ligne)
+            for c in cols:
+                if k >= len(to_show):
+                    break
+                i = int(to_show[k])
+                c.image(imgs_rgb[i], caption=f"#{i} • z={z[i]:.2f}", use_container_width=False)
+                k += 1
+    else:
+        st.info("Aucune frame n’a franchi le seuil d’anomalie pour la sensibilité choisie.")
+
+    # 8) Aperçu global réparti
+    st.subheader("Aperçu global (vignettes réparties sur la vidéo)")
     N = len(imgs_rgb)
-    idxs = np.linspace(0, N-1, num=int(nb_vignettes), dtype=int)
+    idxs = np.linspace(0, N - 1, num=int(nb_vignettes), dtype=int)
     cols_par_ligne = 8
-    lignes = math.ceil(len(idxs) / cols_par_ligne)
+    lignes_nb = math.ceil(len(idxs) / cols_par_ligne)
     k = 0
+    for _ in range(lignes_nb):
+        cols = st.columns(cols_par_ligne)
+        for c in cols:
+            if k >= len(idxs):
+                break
+            i = int(idxs[k])
+            c.image(imgs_rgb[i], caption=f"#{i} • z={z[i]:.2f}", use_container_width=False)
+            k += 1
 
-    if mode_vignettes == "RGB":
-        for _ in range(lignes):
-            cols = st.columns(cols_par_ligne)
-            for c in cols:
-                if k >= len(idxs):
-                    break
-                i = int(idxs[k])
-                c.image(imgs_rgb[i], caption=f"#{i} • t≈{i/float(fps_ech):.1f}s", use_container_width=False)
-                k += 1
-
-    elif mode_vignettes == "Heatmap":
-        for _ in range(lignes):
-            cols = st.columns(cols_par_ligne)
-            for c in cols:
-                if k >= len(idxs):
-                    break
-                i = int(idxs[k])
-                if i == 0:
-                    img = np.zeros_like(imgs_rgb[i])
-                else:
-                    _, mag = farneback_pair(cv2, imgs_gray[i-1], imgs_gray[i])
-                    img = heatmap(cv2, mag)
-                c.image(img, caption=f"HM #{i}", use_container_width=False)
-                k += 1
-
-    else:  # Vecteurs
-        for _ in range(lignes):
-            cols = st.columns(cols_par_ligne)
-            for c in cols:
-                if k >= len(idxs):
-                    break
-                i = int(idxs[k])
-                if i == 0:
-                    img = imgs_rgb[i]
-                else:
-                    flow, _ = farneback_pair(cv2, imgs_gray[i-1], imgs_gray[i])
-                    img = vectors_overlay(cv2, imgs_rgb[i], flow, step=16)
-                c.image(img, caption=f"Vec #{i}", use_container_width=False)
-                k += 1
-
-    if afficher_log:
+    # 9) Journal FFmpeg optionnel
+    if montrer_log:
         with st.expander("Journal FFmpeg"):
             st.code(log_ext or "(log vide)", language="bash")
