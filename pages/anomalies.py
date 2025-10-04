@@ -1,11 +1,10 @@
 # pages/anomalies.py
-# Analyse d'anomalies avec timeline consultable et état persistant.
-# Import MP4 rétabli en haut de page (uploader hors formulaire) + option "Vidéo préparée".
-# - Paramètres regroupés dans un formulaire : pas de recalcul tant que l’on ne clique pas "Lancer l’analyse".
-# - Résultats conservés en session_state pour éviter la réinitialisation lors des interactions d’affichage.
-# - Timeline images réelle : scrubber (navigation image par image) + fenêtre temporelle [t0, t1] défilable.
-# - Axe Temps (s) cohérent : cadence fixe = frame/fps, frames natives = timestamps réels via ffprobe.
-# - Méthodes : LOF / Isolation Forest / Auto-Encodeur, projection 2D Altair, timeline des scores, vignettes, tableau, export.
+# Analyse d'anomalies avec timeline d'images "anomalies uniquement" défilable en direct.
+# - Upload MP4 (hors formulaire) + option "Vidéo préparée"
+# - Paramètres dans un formulaire : l’analyse ne se relance que sur "Lancer l’analyse"
+# - Indicateurs (flux optique Farneback) + méthodes : LOF / Isolation Forest / Auto-Encodeur
+# - Projection 2D Altair, timeline des scores, vignettes, tableau, export
+# - NOUVEAU : Timeline "ANOMALIES UNIQUEMENT" en vignettes, avec curseur dynamique (mise à jour instantanée)
 
 import math
 import shutil
@@ -262,8 +261,8 @@ def projeter_2d(X: np.ndarray, methode: str) -> np.ndarray:
 # ============================= App Streamlit =============================
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
-st.set_page_config(page_title="Anomalies + Timeline consultable", layout="wide")
-st.title("Anomalies + Timeline images consultable")
+st.set_page_config(page_title="Anomalies + Timeline anomalies", layout="wide")
+st.title("Anomalies + Timeline d’images (anomalies uniquement)")
 st.markdown("www.codeandcortex.fr")
 
 ffmpeg_path = trouver_ffmpeg()
@@ -281,7 +280,7 @@ if cv2 is None:
 st.session_state.setdefault("anom", None)
 st.session_state.setdefault("video_upload_path", None)
 
-# ----------------------------- Import MP4 hors formulaire -----------------------------
+# ----------------------------- Upload MP4 hors formulaire -----------------------------
 st.subheader("Importer un MP4")
 up = st.file_uploader("Importer une vidéo (.mp4)", type=["mp4"], key="upload_mp4_global")
 if up is not None:
@@ -402,9 +401,9 @@ if lancer:
         lignes.append(d)
     if not lignes:
         st.error("Aucune paire exploitable pour calculer les indicateurs.")
-        st.stop()
-
     df = pd.DataFrame(lignes)
+
+    # Caractéristiques
     X, cols = construire_X(df, choix_feat)
 
     # Détection d’anomalies
@@ -428,15 +427,12 @@ if lancer:
 
     # État persistant des résultats
     st.session_state["anom"] = {
-        "video_path": str(video_path),
-        "frames_dir": str(frames_dir),
-        "mode": mode,
+        "imgs": imgs,
+        "times": temps_par_frame,
+        "df": df,
+        "cols": cols,
         "fps": int(fps),
-        "imgs": imgs,                     # numpy arrays en mémoire
-        "times": temps_par_frame,         # temps par frame
-        "indices": indices,               # mapping étapes -> frames
-        "df": df,                         # résultats par pas
-        "cols": cols,                     # features utilisées
+        "mode": mode,
     }
 
 # ----------------------------- Affichage résultats persistants -----------------------------
@@ -447,7 +443,6 @@ if not res:
 
 imgs = res["imgs"]
 temps_par_frame = res["times"]
-indices = res["indices"]
 df = res["df"]
 fps = res["fps"]
 mode = res["mode"]
@@ -480,114 +475,94 @@ except Exception as e:
 
 # -------- Timeline des scores (Altair) --------
 st.subheader("Timeline des scores")
-axe_timeline = st.radio("Axe", ["Temps (s)", "Frame", "Étape"], index=0, horizontal=True, key="axe_timeline_scores")
-
-if axe_timeline == "Temps (s)":
-    x_field = alt.X("t:Q", title="Temps (s)")
-elif axe_timeline == "Frame":
-    x_field = alt.X("frame_curr:Q", title="Frame")
-else:
-    x_field = alt.X("etape:Q", title="Étape")
-
+x_field = alt.X("t:Q", title="Temps (s)")
 base_line = alt.Chart(df).mark_line().encode(
     x=x_field,
     y=alt.Y("score_anomalie:Q", title="Score d’anomalie"),
-    tooltip=[alt.Tooltip("etape:Q", title="Étape"),
-             alt.Tooltip("frame_curr:Q", title="Frame"),
-             alt.Tooltip("t:Q", title="Temps (s)", format=".2f"),
-             alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
 ).properties(width=900, height=320)
-
 points_normaux = alt.Chart(df[df["anomalie"] == False]).mark_point(filled=True).encode(
-    x=x_field, y=alt.Y("score_anomalie:Q"),
-    color=alt.value("#377eb8"), size=alt.value(30)
+    x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#377eb8"), size=alt.value(30)
 )
 points_anom = alt.Chart(df[df["anomalie"] == True]).mark_point(filled=True).encode(
-    x=x_field, y=alt.Y("score_anomalie:Q"),
-    color=alt.value("#e41a1c"), size=alt.value(70)
+    x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#e41a1c"), size=alt.value(70)
 )
 st.altair_chart((base_line + points_normaux + points_anom).interactive(), use_container_width=True)
 
-# -------- Timeline IMAGES consultable --------
-st.subheader("Timeline images consultable")
-t_min = float(np.min(temps_par_frame)) if n > 0 else 0.0
-t_max = float(np.max(temps_par_frame)) if n > 0 else 0.0
+# =========================
+# NOUVEAU : Timeline ANOMALIES (images uniquement) avec curseur dynamique
+# =========================
+st.subheader("Timeline anomalies (images uniquement)")
 
-st.session_state.setdefault("scrub_t", t_min)
-st.session_state.setdefault("win_t0", t_min)
-st.session_state.setdefault("win_t1", min(t_min + max(5.0, (t_max - t_min) * 0.05), t_max))
-
-cA, cB = st.columns([1, 1])
-with cA:
-    scrub = st.slider(
-        "Scrubber (temps, navigation image par image)",
-        min_value=t_min, max_value=t_max,
-        value=float(st.session_state["scrub_t"]),
-        step=max(0.001, (t_max - t_min) / max(1000, n))
-    )
-with cB:
-    t0, t1 = st.slider(
-        "Fenêtre temporelle [t0, t1] pour le ruban d’images",
-        min_value=t_min, max_value=t_max,
-        value=(float(st.session_state["win_t0"]), float(st.session_state["win_t1"])),
-        step=max(0.01, (t_max - t_min) / max(1000, n))
-    )
-
-st.session_state["scrub_t"] = float(scrub)
-st.session_state["win_t0"] = float(min(t0, t1))
-st.session_state["win_t1"] = float(max(t0, t1))
-
-idx_scrub = int(np.argmin(np.abs(temps_par_frame - st.session_state["scrub_t"])))
-frame_scrub = np.clip(idx_scrub, 0, n - 1)
-
-st.markdown("Aperçu au temps sélectionné")
-is_anom = bool(df.loc[df["frame_curr"] == frame_scrub, "anomalie"].any()) if "frame_curr" in df else False
-img_scrub = encadrer_rouge_cv2(cv2, imgs[frame_scrub], e=8) if is_anom else imgs[frame_scrub]
-cap_scrub = f"t={temps_par_frame[frame_scrub]:.2f}s • frame {frame_scrub}"
-if "etape" in df.columns:
-    et_scr = df.loc[df["frame_curr"] == frame_scrub, "etape"]
-    if len(et_scr) > 0:
-        cap_scrub += f" • étape {int(et_scr.iloc[0])}"
-if "score_anomalie" in df.columns:
-    sc_scr = df.loc[df["frame_curr"] == frame_scrub, "score_anomalie"]
-    if len(sc_scr) > 0:
-        cap_scrub += f" • score={float(sc_scr.iloc[0]):.3f}"
-st.image(img_scrub, caption=cap_scrub, use_container_width=True)
-
-st.markdown("Ruban d’images sur la fenêtre temporelle")
-mask_win = (temps_par_frame >= st.session_state["win_t0"]) & (temps_par_frame <= st.session_state["win_t1"])
-idxs = np.nonzero(mask_win)[0].tolist()
-
-if len(idxs) == 0:
-    st.info("Aucune image dans cette fenêtre. Ajuste [t0, t1].")
+df_anom = df[df["anomalie"]].copy()
+if len(df_anom) == 0:
+    st.info("Aucune anomalie détectée au seuil demandé.")
 else:
-    frames_anormales = set(df[df["anomalie"]]["frame_curr"].astype(int).tolist())
-    score_map = {int(r["frame_curr"]): float(r["score_anomalie"]) for _, r in df.iterrows()}
-    etape_map = {int(r["frame_curr"]): int(r["etape"]) for _, r in df.iterrows()}
+    # Liste ordonnée des anomalies par temps
+    df_anom = df_anom.sort_values("t", ascending=True).reset_index(drop=True)
+    idx_frames_anom = df_anom["frame_curr"].astype(int).tolist()
+    times_anom = df_anom["t"].astype(float).tolist()
+    scores_anom = df_anom["score_anomalie"].astype(float).tolist()
+    etapes_anom = df_anom["etape"].astype(int).tolist()
+
+    # État persistant du curseur d'anomalies
+    st.session_state.setdefault("anom_index", 0)
+    st.session_state["anom_index"] = int(
+        st.slider("Anomalie courante (index dans la timeline anomalies)",
+                  min_value=0, max_value=len(idx_frames_anom) - 1,
+                  value=int(st.session_state["anom_index"]),
+                  step=1, key="slider_anom_index")
+    )
+
+    # Curseur temporel continu calé sur les anomalies uniquement
+    st.session_state.setdefault("anom_time", float(times_anom[st.session_state["anom_index"]]))
+    anom_time = st.slider(
+        "Temps anomalie (s) — défilement continu sur les seules anomalies",
+        min_value=float(times_anom[0]),
+        max_value=float(times_anom[-1]),
+        value=float(times_anom[st.session_state["anom_index"]]),
+        step=max(0.001, (times_anom[-1] - times_anom[0]) / max(1000, len(times_anom))),
+        key="slider_anom_time"
+    )
+    # Trouver l'anomalie la plus proche du temps sélectionné
+    sel_idx_time = int(np.argmin(np.abs(np.array(times_anom) - anom_time)))
+    # Synchroniser l'index si l'utilisateur bouge le curseur temps
+    if sel_idx_time != st.session_state["anom_index"]:
+        st.session_state["anom_index"] = sel_idx_time
+
+    # Affichage de l'image d'anomalie courante (mise à jour instantanée)
+    i_sel = st.session_state["anom_index"]
+    fr_sel = idx_frames_anom[i_sel]
+    img_sel = encadrer_rouge_cv2(cv2, imgs[fr_sel], e=10)
+    cap_sel = f"t={times_anom[i_sel]:.2f}s • étape {etapes_anom[i_sel]} • frame {fr_sel} • score={scores_anom[i_sel]:.3f}"
+    st.image(img_sel, caption=cap_sel, use_container_width=True)
+
+    # Ruban de vignettes anomalies autour de l’anomalie courante
+    st.markdown("Ruban des anomalies (voisinage autour de la sélection)")
+    voisinage = st.slider("Taille du voisinage (nombre d’anomalies de part et d’autre)", 1, 30, 10, 1, key="voisinage_anom")
+    start = max(0, i_sel - voisinage)
+    end = min(len(idx_frames_anom), i_sel + voisinage + 1)
+    sous_idx = list(range(start, end))
 
     cols_par_ligne = 10
     k = 0
-    for _ in range(math.ceil(len(idxs) / cols_par_ligne)):
+    for _ in range(math.ceil(len(sous_idx) / cols_par_ligne)):
         cols = st.columns(cols_par_ligne)
         for c in cols:
-            if k >= len(idxs):
+            if k >= len(sous_idx):
                 break
-            fr = int(idxs[k])
-            vis = encadrer_rouge_cv2(cv2, imgs[fr], e=6) if fr in frames_anormales else imgs[fr]
-            cap = f"t={temps_par_frame[fr]:.2f}s • frame {fr}"
-            if fr in etape_map:
-                cap += f" • étape {etape_map[fr]}"
-            if fr in score_map:
-                cap += f" • score={score_map[fr]:.3f}"
+            j = sous_idx[k]
+            fr = idx_frames_anom[j]
+            vis = encadrer_rouge_cv2(cv2, imgs[fr], e=6)
+            cap = f"t={times_anom[j]:.2f}s • idx {j} • frame {fr} • score={scores_anom[j]:.3f}"
             c.image(vis, caption=cap, use_container_width=False)
             k += 1
 
-# -------- Vignettes d’anomalies --------
-st.subheader("Vignettes des anomalies")
+# -------- Vignettes d’anomalies (liste complète) --------
+st.subheader("Vignettes des anomalies (liste complète)")
 if nb_ano == 0:
     st.info("Aucune anomalie détectée.")
 else:
-    tri = st.selectbox("Tri", ["Score décroissant", "Temps croissant", "Frame croissant"], index=0, key="tri_anom")
+    tri = st.selectbox("Tri", ["Score décroissant", "Temps croissant", "Frame croissant"], index=0, key="tri_anom_full")
     dfa = df[df["anomalie"]].copy()
     if tri == "Temps croissant":
         dfa = dfa.sort_values("t", ascending=True)
