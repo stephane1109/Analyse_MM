@@ -1,6 +1,7 @@
 streamlit>=1.36
 yt-dlp>=2024.08.06
 opencv-python>=4.9
+opencv-python-headless==4.10.0.84
 soundfile>=0.12
 plotly>=5.22
 numpy>=1.26
