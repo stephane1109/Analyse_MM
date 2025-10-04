@@ -8,3 +8,4 @@ imageio-ffmpeg>=0.4
 openai-whisper
 scikit-learn
 matplotlib
+altair
