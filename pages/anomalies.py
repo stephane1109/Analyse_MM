@@ -3,13 +3,12 @@
 # - Extraction FFmpeg, calcul d'indicateurs (flux optique Farneback)
 # - Méthodes : Local Outlier Factor, Isolation Forest, Auto-Encodeur (MLPRegressor)
 # - Projection 2D Altair (PCA / t-SNE)
-# - Timeline Altair des scores
-# - NOUVEAU : Timeline à vignettes défilables avec encadrement rouge des anomalies
-# - Vignettes, tableau et export CSV
+# - Timeline Altair des scores (Étape / Frame / Temps)
+# - Timeline à vignettes synchronisée au TEMPS (consultation d’images par fenêtre temporelle)
+# - Vignettes anomalies, tableau et export CSV
 
 import math
 import shutil
-import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -28,6 +27,12 @@ def trouver_ffmpeg() -> Optional[str]:
     """Retourne le chemin de ffmpeg si disponible, sinon None."""
     p, _ = info_ffmpeg()
     return p
+
+def deviner_ffprobe(ffmpeg_path: Optional[str]) -> str:
+    """Heuristique : si ffmpeg connu, remplace 'ffmpeg' par 'ffprobe', sinon 'ffprobe'."""
+    if ffmpeg_path and "ffmpeg" in ffmpeg_path:
+        return ffmpeg_path.replace("ffmpeg", "ffprobe")
+    return "ffprobe"
 
 def executer(cmd: List[str]) -> Tuple[bool, str]:
     """Exécute une commande système et retourne (ok, log)."""
@@ -87,6 +92,50 @@ def extraire_frames_1080p(
         cmd += ["-vf", f"fps={fps_ech},scale=1920:-2", "-q:v", "2", motif]
 
     return executer(cmd)
+
+# =============================
+# Timestamps réels (ffprobe)
+# =============================
+
+def lire_timestamps_video(ffprobe: str, video: Path) -> Tuple[bool, List[float], str]:
+    """
+    Lit les timestamps (en secondes) de TOUTES les frames vidéo, via ffprobe.
+    Essaye d'abord best_effort_timestamp_time, sinon pkt_pts_time.
+    Retourne (ok, liste_de_temps, log).
+    """
+    # Essai 1 : best_effort_timestamp_time
+    cmd1 = [
+        ffprobe, "-v", "error", "-select_streams", "v:0",
+        "-show_frames", "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(video)
+    ]
+    ok1, log1 = executer(cmd1)
+    lignes = []
+    if ok1 and log1:
+        lignes = [x.strip() for x in log1.splitlines() if x.strip()]
+    # Si vide, essai 2 : pkt_pts_time
+    if not lignes:
+        cmd2 = [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_frames", "-show_entries", "frame=pkt_pts_time",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video)
+        ]
+        ok2, log2 = executer(cmd2)
+        if ok2 and log2:
+            lignes = [x.strip() for x in log2.splitlines() if x.strip()]
+        ok_global = ok1 or ok2
+        log_global = (log1 + "\n" + log2).strip()
+    else:
+        ok_global = ok1
+        log_global = log1
+
+    temps = []
+    for s in lignes:
+        try:
+            temps.append(float(s))
+        except Exception:
+            continue
+    return ok_global and len(temps) > 0, temps, log_global
 
 # =============================
 # Chargement images et utilitaires image (OpenCV)
@@ -206,7 +255,7 @@ def anomalies_isoforest(X: np.ndarray, contamination: float, n_estimators: int =
         n_jobs=-1
     )
     y = iso.fit_predict(X)  # -1 = outlier
-    scores = -iso.decision_function(X)  # renversé : grand = anormal
+    scores = -iso.decision_function(X)
     return scores, y
 
 def anomalies_autoencodeur(X: np.ndarray, contamination: float, hidden: int = 8, max_iter: int = 400) -> Tuple[np.ndarray, np.ndarray]:
@@ -230,7 +279,7 @@ def anomalies_autoencodeur(X: np.ndarray, contamination: float, hidden: int = 8,
     )
     ae.fit(Xs, Xs)
     X_pred = ae.predict(Xs)
-    err = np.mean((X_pred - Xs) ** 2, axis=1)
+    err = np.mean((X_pred - Xs) ** 2, axis=1)  # MSE par échantillon
 
     seuil = float(np.quantile(err, 1.0 - contamination))
     y = np.where(err >= seuil, -1, 1)
@@ -261,19 +310,22 @@ def projeter_2d(X: np.ndarray, methode: str) -> np.ndarray:
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Tests anomalies + Altair 2D + Timeline vignettes", layout="wide")
-st.title("Tests d’anomalies sur indicateurs + projection 2D, timeline et vignettes")
+st.set_page_config(page_title="Anomalies + Altair + Timeline images", layout="wide")
+st.title("Anomalies sur indicateurs + projection 2D + timeline images")
 st.markdown("www.codeandcortex.fr")
 
 st.markdown(
-    "Scores d’anomalie : plus le score est grand, plus le pas est jugé anormal par la méthode choisie. "
-    "Coordonnées (x, y) : position dans la projection 2D (PCA ou t-SNE) utilisée pour la visualisation."
+    "Scores d’anomalie : **plus le score est grand, plus le pas est jugé anormal**. "
+    "Coordonnées (x, y) : position dans la projection 2D (PCA/t-SNE). "
+    "La **timeline images** est synchronisée au **temps vidéo**."
 )
 
-ff = trouver_ffmpeg()
-if not ff:
+# Vérifications préalables
+ffmpeg_path = trouver_ffmpeg()
+if not ffmpeg_path:
     st.error("FFmpeg introuvable. Binaire attendu sous /usr/bin/ffmpeg ou similaire.")
     st.stop()
+ffprobe_path = deviner_ffprobe(ffmpeg_path)
 
 cv2, cv_err = importer_cv2()
 if cv2 is None:
@@ -333,7 +385,7 @@ else:
     hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
 
 # Choix de l'axe de la timeline de scores
-axe_timeline = st.radio("Axe de la timeline (scores)", ["Étape", "Frame", "Temps (s)"], index=0, horizontal=True)
+axe_timeline = st.radio("Axe de la timeline (scores)", ["Étape", "Frame", "Temps (s)"], index=2, horizontal=True)
 
 # Lancement
 if st.button("Lancer les tests", type="primary"):
@@ -344,7 +396,7 @@ if st.button("Lancer les tests", type="primary"):
     # Extraction d'images
     frames_dir = (BASE_DIR / "frames_anom" / video_path.stem).resolve()
     mode = "natifs" if mode_ext == "Frames natives" else "fixe"
-    ok, log = extraire_frames_1080p(trouver_ffmpeg(), video_path, frames_dir, mode, int(fps))
+    ok, log = extraire_frames_1080p(ffmpeg_path, video_path, frames_dir, mode, int(fps))
     if not ok:
         st.error("Échec extraction d’images avec FFmpeg.")
         st.code(log or "(journal vide)", language="bash")
@@ -358,12 +410,33 @@ if st.button("Lancer les tests", type="primary"):
         st.error("Trop peu d’images pour analyser.")
         st.stop()
 
-    # Construction des indices par pas avec "pas" entre frames
+    # Timestamps des frames (temps vidéo global)
+    temps_par_frame: Optional[np.ndarray] = None
+    if mode == "natifs":
+        ok_ts, ts_all, log_ts = lire_timestamps_video(ffprobe_path, video_path)
+        if not ok_ts or len(ts_all) == 0:
+            st.warning("Timestamps réels indisponibles (ffprobe). La timeline utilisera l’index de frame.")
+        else:
+            # On s'attend à un mapping 1:1 : une image extraite par frame source en ordre
+            # Sécurisation : on tronque à la taille extraite si besoin.
+            m = min(len(ts_all), n)
+            temps_par_frame = np.array(ts_all[:m], dtype=float)
+            if m < n:
+                # Si jamais moins de timestamps que d'images (rare), on extrapole simple.
+                dernier = temps_par_frame[-1] if m > 0 else 0.0
+                extra = np.linspace(dernier, dernier + (n - m) * 1.0 / max(1, fps), num=(n - m), endpoint=False)
+                temps_par_frame = np.concatenate([temps_par_frame, extra])
+    else:
+        # Cadence fixe : temps = frame / fps
+        temps_par_frame = np.arange(n, dtype=float) / float(max(1, fps))
+
+    # Construction des indices de pas (intervalle entre frames analysées)
     indices = list(range(0, n, int(pas)))
     if len(indices) < 2:
         st.warning("Pas d’analyse trop grand pour la séquence. Utilisation automatique de pas=1.")
         indices = list(range(0, n, 1))
 
+    # Indicateurs par pas
     lignes: List[Dict[str, float]] = []
     echecs = 0
     for k in range(1, len(indices)):
@@ -373,7 +446,11 @@ if st.button("Lancer les tests", type="primary"):
         if met is None:
             echecs += 1
             continue
-        lignes.append({"etape": k, "frame_prev": i0, "frame_curr": i1, **met})
+        d = {"etape": k, "frame_prev": i0, "frame_curr": i1, **met}
+        # Ajoute temps de la frame d'arrivée si disponible
+        if temps_par_frame is not None and i1 < len(temps_par_frame):
+            d["t"] = float(temps_par_frame[i1])
+        lignes.append(d)
 
     if not lignes:
         st.error("Aucune paire exploitable pour calculer les indicateurs. Essaie pas=1.")
@@ -410,9 +487,7 @@ if st.button("Lancer les tests", type="primary"):
     try:
         emb = projeter_2d(X, methode=projection)
         df["x"], df["y"] = emb[:, 0], emb[:, 1]
-
         hover2d = alt.selection_point(fields=["etape"], on="mouseover", nearest=True, empty=False)
-
         base2d = alt.Chart(df).mark_point(filled=True).encode(
             x=alt.X("x:Q", title="Composante 1"),
             y=alt.Y("y:Q", title="Composante 2"),
@@ -424,39 +499,31 @@ if st.button("Lancer les tests", type="primary"):
                      alt.Tooltip("frame_curr:Q", title="Frame"),
                      alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
         ).add_params(hover2d).properties(width=700, height=480)
-
         st.altair_chart((base2d + base2d.transform_filter(hover2d).mark_point(stroke="black", strokeWidth=1.5)).interactive(),
                         use_container_width=True)
     except Exception as e:
         st.warning(f"Projection 2D indisponible : {e}")
 
     # =========================
-    # Timeline Altair des scores et anomalies
+    # Timeline Altair des scores
     # =========================
     st.subheader("Timeline des scores et anomalies")
     st.caption("Courbe des scores avec points rouges pour les anomalies. Axe au choix : Étape, Frame, Temps (s).")
 
-    if axe_timeline == "Temps (s)":
-        if mode == "fixe":
-            df["t"] = df["frame_curr"].astype(float) / float(fps)
-            x_field = alt.X("t:Q", title="Temps (s)")
-        else:
-            st.info("En frames natives, la cadence n’est pas garantie : utilisation de l’axe Étape.")
-            df["t"] = df["etape"].astype(float)
-            x_field = alt.X("t:Q", title="Étape")
+    if axe_timeline == "Temps (s)" and "t" in df.columns:
+        x_field = alt.X("t:Q", title="Temps (s)")
     elif axe_timeline == "Frame":
-        df["t"] = df["frame_curr"].astype(float)
-        x_field = alt.X("t:Q", title="Frame")
+        x_field = alt.X("frame_curr:Q", title="Frame")
     else:
-        df["t"] = df["etape"].astype(float)
-        x_field = alt.X("t:Q", title="Étape")
+        x_field = alt.X("etape:Q", title="Étape")
 
     base_line = alt.Chart(df).mark_line().encode(
         x=x_field,
         y=alt.Y("score_anomalie:Q", title="Score d’anomalie"),
         tooltip=[alt.Tooltip("etape:Q", title="Étape"),
                  alt.Tooltip("frame_curr:Q", title="Frame"),
-                 alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
+                 alt.Tooltip("score_anomalie:Q", title="Score", format=".3f"),
+                 alt.Tooltip("t:Q", title="Temps (s)", format=".2f")]
     ).properties(width=900, height=320)
 
     points_normaux = alt.Chart(df[df["anomalie"] == False]).mark_point(filled=True).encode(
@@ -467,65 +534,77 @@ if st.button("Lancer les tests", type="primary"):
         x=x_field, y=alt.Y("score_anomalie:Q"),
         color=alt.value("#e41a1c"), size=alt.value(70)
     )
-
     st.altair_chart((base_line + points_normaux + points_anom).interactive(), use_container_width=True)
 
     # =========================
-    # NOUVEAU : Timeline à vignettes défilables
+    # Timeline IMAGES synchronisée au TEMPS
     # =========================
-    st.subheader("Timeline à vignettes défilables")
-    st.caption(
-        "Utilise la fenêtre pour parcourir rapidement toute la vidéo. "
-        "Les anomalies sont encadrées en rouge. La légende sous chaque vignette rappelle l’étape, la frame et le score."
-    )
+    st.subheader("Timeline images synchronisée au temps")
+    if temps_par_frame is None or len(temps_par_frame) != n:
+        st.info("Timestamps réels indisponibles : la timeline images utilisera l’index de frame.")
+        temps_par_frame = np.arange(n, dtype=float)
 
-    # Ensemble des frames anormales (par destination)
-    frames_anormales = set(df[df["anomalie"]]["frame_curr"].astype(int).tolist())
-    score_map = {int(r["frame_curr"]): float(r["score_anomalie"]) for _, r in df.iterrows()}
-    etape_map = {int(r["frame_curr"]): int(r["etape"]) for _, r in df.iterrows()}
+    t_min = float(np.min(temps_par_frame))
+    t_max = float(np.max(temps_par_frame)) if n > 0 else 0.0
+    # Taille de fenêtre par défaut : 10 secondes (ou 5 % de la durée si longue)
+    fenetre_def = max(5.0, (t_max - t_min) * 0.05)
 
-    # Contrôles de fenêtre
-    st.session_state.setdefault("win_start", 0)
-    st.session_state.setdefault("win_size", 20)
+    # État de la fenêtre temporelle
+    st.session_state.setdefault("t0", t_min)
+    st.session_state.setdefault("t1", min(t_min + fenetre_def, t_max))
 
-    cW1, cW2, cW3, cW4 = st.columns([2, 2, 1, 1])
-    with cW1:
-        win_size = st.slider("Taille de la fenêtre (nombre de vignettes)", min_value=8, max_value=60, value=int(st.session_state["win_size"]), step=1)
-    with cW2:
-        max_start = max(0, len(imgs) - win_size)
-        win_start = st.slider("Position de la fenêtre", min_value=0, max_value=max_start, value=int(st.session_state["win_start"]), step=1)
-    with cW3:
-        if st.button("Reculer"):
-            win_start = max(0, win_start - win_size)
-    with cW4:
-        if st.button("Avancer"):
-            win_start = min(max_start, win_start + win_size)
+    cTW1, cTW2, cTW3, cTW4 = st.columns([3, 3, 1, 1])
+    with cTW1:
+        t0, t1 = st.slider(
+            "Fenêtre temporelle [s]",
+            min_value=t_min, max_value=t_max,
+            value=(float(st.session_state["t0"]), float(st.session_state["t1"])),
+            step=max(0.01, (t_max - t_min) / max(1000, n))
+        )
+    with cTW2:
+        pas_decal = st.number_input("Décalage fenêtre (s)", min_value=0.1, max_value=60.0, value=fenetre_def, step=0.1)
+    with cTW3:
+        if st.button("◀ Reculer"):
+            t0 = max(t_min, t0 - pas_decal)
+            t1 = max(t0, t1 - pas_decal)
+    with cTW4:
+        if st.button("Avancer ▶"):
+            t1 = min(t_max, t1 + pas_decal)
+            t0 = min(t1, t0 + pas_decal)
 
-    st.session_state["win_start"] = int(win_start)
-    st.session_state["win_size"] = int(win_size)
+    st.session_state["t0"], st.session_state["t1"] = float(t0), float(t1)
 
-    # Affichage de la fenêtre sous forme de ruban
-    debut = int(win_start)
-    fin = int(min(len(imgs), win_start + win_size))
-    bande = list(range(debut, fin))
+    # Sélection des frames dont le temps ∈ [t0, t1]
+    mask = (temps_par_frame >= t0) & (temps_par_frame <= t1)
+    idx_fenetre = np.nonzero(mask)[0].tolist()
 
-    cols_par_ligne = 10
-    k = 0
-    for _ in range(math.ceil(len(bande) / cols_par_ligne)):
-        cols_st = st.columns(cols_par_ligne)
-        for c in cols_st:
-            if k >= len(bande):
-                break
-            fr = int(bande[k])
-            img = encadrer_rouge_cv2(cv2, imgs[fr], e=6) if fr in frames_anormales else imgs[fr]
-            s = score_map.get(fr, None)
-            et = etape_map.get(fr, None)
-            if s is not None and et is not None:
-                cap = f"étape {et} • frame {fr} • score={s:.3f}"
-            else:
-                cap = f"frame {fr}"
-            c.image(img, caption=cap, use_container_width=False)
-            k += 1
+    if len(idx_fenetre) == 0:
+        st.warning("Aucune image dans cette fenêtre de temps. Ajuste la fenêtre.")
+    else:
+        # Affichage en ruban des vignettes, anomalies encadrées en rouge
+        frames_anormales = set(df[df["anomalie"]]["frame_curr"].astype(int).tolist())
+        score_map = {int(r["frame_curr"]): float(r["score_anomalie"]) for _, r in df.iterrows()}
+        etape_map = {int(r["frame_curr"]): int(r["etape"]) for _, r in df.iterrows()}
+        time_map = {i: float(temps_par_frame[i]) for i in idx_fenetre}
+
+        cols_par_ligne = 10
+        k = 0
+        for _ in range(math.ceil(len(idx_fenetre) / cols_par_ligne)):
+            cols_st = st.columns(cols_par_ligne)
+            for c in cols_st:
+                if k >= len(idx_fenetre):
+                    break
+                fr = int(idx_fenetre[k])
+                img = encadrer_rouge_cv2(cv2, imgs[fr], e=6) if fr in frames_anormales else imgs[fr]
+                s = score_map.get(fr, None)
+                et = etape_map.get(fr, None)
+                tt = time_map.get(fr, None)
+                if s is not None and et is not None and tt is not None:
+                    cap = f"t={tt:.2f}s • étape {et} • frame {fr} • score={s:.3f}"
+                else:
+                    cap = f"frame {fr}"
+                c.image(img, caption=cap, use_container_width=False)
+                k += 1
 
     # =========================
     # Vignettes anomalies (sélection)
@@ -535,7 +614,10 @@ if st.button("Lancer les tests", type="primary"):
     if nb_ano == 0:
         st.info("Aucune anomalie détectée au seuil demandé.")
     else:
-        tri = st.selectbox("Trier les vignettes d’anomalies", ["Score décroissant", "x croissant (projection)", "y croissant (projection)"], index=0)
+        tri = st.selectbox(
+            "Trier les vignettes d’anomalies",
+            ["Score décroissant", "x croissant (projection)", "y croissant (projection)"], index=0
+        )
         dfa = df[df["anomalie"]].copy()
         if "x" in dfa and "y" in dfa:
             if tri == "x croissant (projection)":
@@ -560,6 +642,8 @@ if st.button("Lancer les tests", type="primary"):
                 if 0 <= dst < len(imgs):
                     vis = encadrer_rouge_cv2(cv2, imgs[dst], e=8)
                     cap = f"frame {dst} • score={row['score_anomalie']:.3f}"
+                    if "t" in row and not pd.isna(row["t"]):
+                        cap = f"t={float(row['t']):.2f}s • " + cap
                     if "x" in row and "y" in row and not (pd.isna(row["x"]) or pd.isna(row["y"])):
                         cap += f" • (x={row['x']:.2f}, y={row['y']:.2f})"
                     c.image(vis, caption=cap, use_container_width=False)
@@ -573,7 +657,7 @@ if st.button("Lancer les tests", type="primary"):
     if "x" in df and "y" in df:
         colonnes_aff += ["x", "y"]
     if "t" in df:
-        colonnes_aff = ["t"] + colonnes_aff
+        colonnes_aff = ["t"] + colonnes_aff  # place le temps en première colonne si présent
     st.dataframe(df[colonnes_aff])
 
     st.subheader("Exporter les résultats")
