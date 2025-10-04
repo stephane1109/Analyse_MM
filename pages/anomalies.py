@@ -1,11 +1,11 @@
 # pages/anomalies.py
-# Détection d'anomalies et TIMELINE D'ANOMALIES EN VIGNETTES (images posées sur l'axe du temps).
-# - Upload MP4 (hors formulaire) + option "Vidéo préparée"
-# - Paramètres dans un formulaire : l’analyse ne se relance que sur "Lancer l’analyse"
-# - Indicateurs (flux optique Farneback) + méthodes : LOF / Isolation Forest / Auto-Encodeur
+# Analyse d'anomalies et TIMELINE D'ANOMALIES EN VIGNETTES (Altair mark_image).
+# - Upload MP4 hors formulaire + option "Vidéo préparée"
+# - Paramètres d'analyse dans un formulaire : extraction FFmpeg, indicateurs (Farneback), anomalies (LOF/ISO/AE)
+# - Résultats persistants en session_state
+# - Timeline d'anomalies en vignettes posées sur l'axe du temps (data URI PNG)
+# - Curseur de temps dynamique pour faire défiler l'aperçu grand format
 # - Projection 2D Altair, timeline des scores, vignettes, tableau, export
-# - NOUVEAU : Altair mark_image avec data URI pour placer chaque anomalie à son temps t sur une timeline
-# - Curseur de temps dynamique (hors formulaire) pour voir défiler l’aperçu grand format de l’anomalie la plus proche
 
 import io
 import math
@@ -29,7 +29,7 @@ def trouver_ffmpeg() -> Optional[str]:
     return p
 
 def deviner_ffprobe(ffmpeg_path: Optional[str]) -> str:
-    """Si on connaît ffmpeg, on déduit ffprobe, sinon 'ffprobe'."""
+    """Si ffmpeg est connu, déduire ffprobe, sinon 'ffprobe'."""
     if ffmpeg_path and "ffmpeg" in ffmpeg_path:
         return ffmpeg_path.replace("ffmpeg", "ffprobe")
     return "ffprobe"
@@ -52,7 +52,7 @@ def executer(cmd: List[str]) -> Tuple[bool, str]:
         return False, f"Erreur d'exécution : {e}"
 
 def importer_cv2():
-    """Import d'OpenCV (headless recommandé)."""
+    """Import d'OpenCV (opencv-python-headless recommandé en requirements.txt)."""
     try:
         import cv2  # type: ignore
         return cv2, None
@@ -63,7 +63,7 @@ def importer_cv2():
 
 @st.cache_data(show_spinner=False)
 def extraire_frames_1080p_cache(ffmpeg: str, video: str, dossier: str, mode_extraction: str, fps_ech: int) -> Tuple[bool, str]:
-    """Version mise en cache de l'extraction d'images pour éviter les recalculs intempestifs."""
+    """Extraction d'images mise en cache pour éviter les recalculs inutiles."""
     return extraire_frames_1080p(ffmpeg, Path(video), Path(dossier), mode_extraction, fps_ech)
 
 def extraire_frames_1080p(
@@ -95,7 +95,7 @@ def extraire_frames_1080p(
 
 @st.cache_data(show_spinner=False)
 def lire_timestamps_video_cache(ffprobe: str, video: str) -> Tuple[bool, List[float], str]:
-    """Version mise en cache pour lecture des timestamps via ffprobe."""
+    """Lecture des timestamps via ffprobe (mise en cache)."""
     return lire_timestamps_video(ffprobe, Path(video))
 
 def lire_timestamps_video(ffprobe: str, video: Path) -> Tuple[bool, List[float], str]:
@@ -269,10 +269,10 @@ def fabriquer_vignette_datauri(cv2, img_rgb: np.ndarray, largeur: int = 120, cad
     if cadre_rouge:
         img_rgb = encadrer_rouge_cv2(cv2, img_rgb, e=max(2, int(largeur * 0.05)))
     ratio = largeur / max(1, w)
-    nv_h = int(round(h * ratio))
-    img_res = cv2.resize(img_rgb, (largeur, nv_h), interpolation=cv2.INTER_AREA)
-    # Encodage PNG en mémoire
-    ok, buf = cv2.imencode(".png", cv2.cvtColor(img_res, cv2.COLOR_RGB2BGR))
+    nv_h = int(max(1, round(h * ratio)))
+    import cv2 as _cv2  # éviter confusion type checker
+    img_res = _cv2.resize(img_rgb, (largeur, nv_h), interpolation=_cv2.INTER_AREA)
+    ok, buf = _cv2.imencode(".png", _cv2.cvtColor(img_res, _cv2.COLOR_RGB2BGR))
     if not ok:
         return ""
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
@@ -445,11 +445,33 @@ if lancer:
     except Exception:
         df["x"], df["y"] = np.nan, np.nan
 
+    # Préparation des vignettes anomalies pour Altair
+    dfa = df[df["anomalie"]].copy()
+    dfa = dfa.sort_values("t", ascending=True).reset_index(drop=True)
+    urls = []
+    for _, row in dfa.iterrows():
+        fr = int(row["frame_curr"])
+        if 0 <= fr < n:
+            uri = fabriquer_vignette_datauri(cv2, imgs[fr], largeur=120, cadre_rouge=True)
+            urls.append(uri)
+        else:
+            urls.append("")
+    dfa["url"] = urls  # le canal Altair attend "url"
+
+    # Rangées verticales pour éviter le chevauchement
+    if len(dfa) > 0:
+        nb_lignes = min(3, max(1, len(dfa)//25 + 1))
+        espace_vertical = 80
+        dfa["y"] = [(i % nb_lignes) * espace_vertical for i in range(len(dfa))]
+    else:
+        dfa["y"] = []
+
     # État persistant des résultats
     st.session_state["anom"] = {
         "imgs": imgs,
         "times": temps_par_frame,
         "df": df,
+        "dfa": dfa,            # anomalies uniquement avec data URI
         "cols": cols,
         "fps": int(fps),
         "mode": mode,
@@ -464,6 +486,7 @@ if not res:
 imgs = res["imgs"]
 temps_par_frame = res["times"]
 df = res["df"]
+dfa = res["dfa"]
 fps = res["fps"]
 mode = res["mode"]
 n = len(imgs)
@@ -475,133 +498,123 @@ st.write(f"Images extraites : {n} • Paires analysées : {len(df)} • Anomalie
 # -------- Projection 2D Altair --------
 st.subheader("Projection 2D (Altair)")
 try:
-    hover2d = alt.selection_point(fields=["etape"], on="mouseover", nearest=True, empty=False)
-    base2d = alt.Chart(df).mark_point(filled=True).encode(
-        x=alt.X("x:Q", title="Composante 1"),
-        y=alt.Y("y:Q", title="Composante 2"),
-        color=alt.Color("etat:N",
-                        scale=alt.Scale(domain=["Normal", "Anomalie"], range=["#377eb8", "#e41a1c"]),
-                        title="État"),
-        size=alt.Size("etat:N", scale=alt.Scale(domain=["Normal", "Anomalie"], range=[30, 70]), legend=None),
-        tooltip=[alt.Tooltip("etape:Q", title="Étape"),
-                 alt.Tooltip("frame_curr:Q", title="Frame"),
-                 alt.Tooltip("t:Q", title="Temps (s)", format=".2f"),
-                 alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
-    ).add_params(hover2d).properties(width=700, height=480)
-    st.altair_chart((base2d + base2d.transform_filter(hover2d).mark_point(stroke="black", strokeWidth=1.5)).interactive(),
-                    use_container_width=True)
+    if "x" in df and "y" in df and not df["x"].isna().all():
+        hover2d = alt.selection_point(fields=["etape"], on="mouseover", nearest=True, empty=False)
+        base2d = alt.Chart(df).mark_point(filled=True).encode(
+            x=alt.X("x:Q", title="Composante 1"),
+            y=alt.Y("y:Q", title="Composante 2"),
+            color=alt.Color("etat:N",
+                            scale=alt.Scale(domain=["Normal", "Anomalie"], range=["#377eb8", "#e41a1c"]),
+                            title="État"),
+            size=alt.Size("etat:N", scale=alt.Scale(domain=["Normal", "Anomalie"], range=[30, 70]), legend=None),
+            tooltip=[alt.Tooltip("etape:Q", title="Étape"),
+                     alt.Tooltip("frame_curr:Q", title="Frame"),
+                     alt.Tooltip("t:Q", title="Temps (s)", format=".2f"),
+                     alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
+        ).add_params(hover2d).properties(width=700, height=440)
+        st.altair_chart((base2d + base2d.transform_filter(hover2d).mark_point(stroke="black", strokeWidth=1.5)).interactive(),
+                        use_container_width=True)
+    else:
+        st.info("Projection 2D indisponible (échantillon trop faible ou PCA/t-SNE non calculable).")
 except Exception as e:
     st.warning(f"Projection indisponible : {e}")
 
 # -------- Timeline des scores (Altair) --------
 st.subheader("Timeline des scores")
-x_field = alt.X("t:Q", title="Temps (s)")
-base_line = alt.Chart(df).mark_line().encode(
-    x=x_field,
-    y=alt.Y("score_anomalie:Q", title="Score d’anomalie"),
-).properties(width=900, height=280)
-points_normaux = alt.Chart(df[df["anomalie"] == False]).mark_point(filled=True).encode(
-    x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#377eb8"), size=alt.value(30)
-)
-points_anom = alt.Chart(df[df["anomalie"] == True]).mark_point(filled=True).encode(
-    x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#e41a1c"), size=alt.value(70)
-)
-st.altair_chart((base_line + points_normaux + points_anom).interactive(), use_container_width=True)
+try:
+    x_field = alt.X("t:Q", title="Temps (s)")
+    base_line = alt.Chart(df).mark_line().encode(
+        x=x_field,
+        y=alt.Y("score_anomalie:Q", title="Score d’anomalie"),
+    ).properties(width=1000, height=240)
+    points_normaux = alt.Chart(df[df["anomalie"] == False]).mark_point(filled=True).encode(
+        x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#377eb8"), size=alt.value(30)
+    )
+    points_anom = alt.Chart(df[df["anomalie"] == True]).mark_point(filled=True).encode(
+        x=x_field, y=alt.Y("score_anomalie:Q"), color=alt.value("#e41a1c"), size=alt.value(70)
+    )
+    st.altair_chart((base_line + points_normaux + points_anom).interactive(), use_container_width=True)
+except Exception as e:
+    st.warning(f"Timeline des scores indisponible : {e}")
 
 # =========================
-# TIMELINE D'ANOMALIES EN VIGNETTES (Altair mark_image + data URI)
+# TIMELINE D'ANOMALIES EN VIGNETTES
 # =========================
 st.subheader("Timeline d’anomalies en vignettes (posées sur le temps)")
 
-df_anom = df[df["anomalie"]].copy()
-if len(df_anom) == 0:
-    st.info("Aucune anomalie détectée au seuil demandé.")
+if dfa is None or len(dfa) == 0:
+    st.info("Aucune anomalie détectée au seuil demandé. Ajuste la contamination ou la méthode.")
 else:
-    df_anom = df_anom.sort_values("t", ascending=True).reset_index(drop=True)
+    try:
+        # Nettoyage : retirer les lignes sans URL (sécurité)
+        dfa_plot = dfa[dfa["url"] != ""].copy()
+        if len(dfa_plot) == 0:
+            st.warning("Aucune vignette disponible pour les anomalies (URLs vides).")
+        else:
+            # Graphique images posées à (t, y)
+            timeline_img = alt.Chart(dfa_plot).mark_image().encode(
+                x=alt.X("t:Q", title="Temps (s)"),
+                y=alt.Y("y:Q", axis=None),
+                url=alt.Url("url:N", title="Vignette"),
+                tooltip=[
+                    alt.Tooltip("t:Q", title="Temps (s)", format=".2f"),
+                    alt.Tooltip("frame_curr:Q", title="Frame"),
+                    alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")
+                ]
+            ).properties(height=int(dfa_plot["y"].max() + 120 if "y" in dfa_plot else 200), width=1000)
 
-    # Paramètres d’affichage
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        largeur_vignette = st.slider("Largeur vignette (px)", 60, 200, 120, 2, key="larg_vign")
-    with cB:
-        lignes_empilees = st.slider("Nombre de lignes", 1, 5, 3, 1, key="nb_lignes")
-    with cC:
-        espace_vertical = st.slider("Espacement vertical", 40, 140, 80, 5, key="esp_v")
+            st.altair_chart(timeline_img.interactive(), use_container_width=True)
 
-    # Génération des vignettes en data URI, et coordonnées (x=t, y=ligne) pour éviter chevauchement
-    urls, ys = [], []
-    for i, row in df_anom.iterrows():
-        fr = int(row["frame_curr"])
-        img = imgs[fr] if 0 <= fr < n else None
-        if img is None:
-            urls.append("")
-            ys.append(0)
-            continue
-        uri = fabriquer_vignette_datauri(cv2, img, largeur=largeur_vignette, cadre_rouge=True)
-        urls.append(uri)
-        ys.append((i % max(1, lignes_empilees)) * espace_vertical)
+            # Curseur de temps dynamique hors formulaire
+            t_min = float(dfa_plot["t"].min())
+            t_max = float(dfa_plot["t"].max())
+            st.session_state.setdefault("curseur_t_anom", t_min)
+            curseur_t = st.slider(
+                "Curseur temps (visualisation dynamique de l’anomalie la plus proche)",
+                min_value=t_min, max_value=t_max,
+                value=float(st.session_state["curseur_t_anom"]),
+                step=max(0.001, (t_max - t_min) / max(1000, len(dfa_plot))),
+                key="slider_curseur_t_anom"
+            )
+            st.session_state["curseur_t_anom"] = float(curseur_t)
 
-    df_anom["url_vignette"] = urls
-    df_anom["y"] = ys
+            # Trouver l’anomalie la plus proche du curseur et l’afficher en grand immédiatement
+            arr_t = dfa_plot["t"].to_numpy(dtype=float)
+            idx_proche = int(np.argmin(np.abs(arr_t - st.session_state["curseur_t_anom"])))
+            row = dfa_plot.iloc[idx_proche]
+            fr_sel = int(row["frame_curr"])
+            if 0 <= fr_sel < n:
+                img_sel = encadrer_rouge_cv2(cv2, imgs[fr_sel], e=10)
+                cap_sel = f"t={float(row['t']):.2f}s • étape {int(row['etape'])} • frame {fr_sel} • score={float(row['score_anomalie']):.3f}"
+                st.image(img_sel, caption=cap_sel, use_container_width=True)
+            else:
+                st.warning("Frame hors limites pour l’aperçu.")
+    except Exception as e:
+        st.error(f"Erreur d’affichage Altair (timeline vignettes) : {e}")
 
-    # Construction du graphique Altair avec images posées à (t, y)
-    timeline_img = alt.Chart(df_anom).mark_image().encode(
-        x=alt.X("t:Q", title="Temps (s)"),
-        y=alt.Y("y:Q", axis=None),
-        url="url_vignette:N",
-        tooltip=[
-            alt.Tooltip("t:Q", title="Temps (s)", format=".2f"),
-            alt.Tooltip("frame_curr:Q", title="Frame"),
-            alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")
-        ]
-    ).properties(height=max(140, lignes_empilees * espace_vertical + 40), width=1000)
-
-    st.altair_chart(timeline_img.interactive(), use_container_width=True)
-
-    # Curseur temps dynamique hors formulaire pour faire défiler l’aperçu grand format
-    t_min = float(df_anom["t"].min())
-    t_max = float(df_anom["t"].max())
-    st.session_state.setdefault("curseur_t_anom", t_min)
-    curseur_t = st.slider(
-        "Curseur temps (visualisation dynamique de l’anomalie la plus proche)",
-        min_value=t_min, max_value=t_max,
-        value=float(st.session_state["curseur_t_anom"]),
-        step=max(0.001, (t_max - t_min) / max(1000, len(df_anom))),
-        key="slider_curseur_t_anom"
-    )
-    st.session_state["curseur_t_anom"] = float(curseur_t)
-
-    # Trouver l’anomalie la plus proche du curseur et l’afficher en grand directement
-    idx_proche = int(np.argmin(np.abs(df_anom["t"].to_numpy(dtype=float) - st.session_state["curseur_t_anom"])))
-    row = df_anom.iloc[idx_proche]
-    fr_sel = int(row["frame_curr"])
-    img_sel = encadrer_rouge_cv2(cv2, imgs[fr_sel], e=10)
-    cap_sel = f"t={float(row['t']):.2f}s • étape {int(row['etape'])} • frame {fr_sel} • score={float(row['score_anomalie']):.3f}"
-    st.image(img_sel, caption=cap_sel, use_container_width=True)
-
-# -------- Vignettes d’anomalies (liste tabulaire simple) --------
+# -------- Vignettes des anomalies (liste) --------
 st.subheader("Vignettes des anomalies (liste)")
 if nb_ano == 0:
     st.info("Aucune anomalie détectée.")
 else:
     tri = st.selectbox("Tri", ["Score décroissant", "Temps croissant", "Frame croissant"], index=0, key="tri_anom_full")
-    dfa = df[df["anomalie"]].copy()
+    dfl = df[df["anomalie"]].copy()
     if tri == "Temps croissant":
-        dfa = dfa.sort_values("t", ascending=True)
+        dfl = dfl.sort_values("t", ascending=True)
     elif tri == "Frame croissant":
-        dfa = dfa.sort_values("frame_curr", ascending=True)
+        dfl = dfl.sort_values("frame_curr", ascending=True)
     else:
-        dfa = dfa.sort_values("score_anomalie", ascending=False)
+        dfl = dfl.sort_values("score_anomalie", ascending=False)
 
     cols_par_ligne = 8
     k = 0
     max_show = 24
-    for _ in range(math.ceil(min(len(dfa), max_show) / cols_par_ligne)):
+    for _ in range(math.ceil(min(len(dfl), max_show) / cols_par_ligne)):
         cols = st.columns(cols_par_ligne)
         for c in cols:
-            if k >= min(len(dfa), max_show):
+            if k >= min(len(dfl), max_show):
                 break
-            r = dfa.iloc[k]
+            r = dfl.iloc[k]
             fr = int(r["frame_curr"])
             if 0 <= fr < n:
                 vis = encadrer_rouge_cv2(cv2, imgs[fr], e=8)
