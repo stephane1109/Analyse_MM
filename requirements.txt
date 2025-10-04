@@ -5,3 +5,4 @@ soundfile>=0.12
 plotly>=5.22
 numpy>=1.26
 imageio-ffmpeg>=0.4
+openai-whisper
