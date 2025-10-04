@@ -1,4 +1,4 @@
-yt-dl
+yt-dlp
 faster-whisper==1.0.3
 ctranslate2==4.6.0
 tokenizers==0.15.2
