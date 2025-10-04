@@ -1,9 +1,7 @@
 # pages/anomalies.py
-# Tests de détection d'anomalies sur des indicateurs de mouvement extraits d'une vidéo.
-# Méthodes proposées : Local Outlier Factor, Isolation Forest, Auto-Encodeur (MLPRegressor).
-# Indicateurs disponibles (par pas entre frames) : magnitude moyenne (flux optique Farneback), énergie, P95, etc.
-# Le pipeline extrait des images 1080p via FFmpeg (frames natives ou cadence fixe), calcule les features,
-# puis applique la méthode d'anomalies choisie et affiche les résultats avec visualisations et CSV.
+# Détection d'anomalies sur indicateurs de mouvement avec visualisation 2D type "clustering".
+# Méthodes : Local Outlier Factor, Isolation Forest, Auto-Encodeur léger (MLPRegressor).
+# Visualisation : projection 2D (PCA rapide ou t-SNE) avec points = pas (frame d'arrivée), anomalies en rouge.
 
 import math
 import shutil
@@ -188,8 +186,7 @@ def anomalies_lof(X: np.ndarray, contamination: float, n_neighbors: int = 20, me
     from sklearn.neighbors import LocalOutlierFactor
     lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=contamination, novelty=False, metric=metric)
     y = lof.fit_predict(X)  # -1 = outlier, 1 = inlier
-    # score négatif : plus petit => plus anormal. On renverse pour avoir 'grand = plus anormal'.
-    scores = -lof.negative_outlier_factor_
+    scores = -lof.negative_outlier_factor_  # renversé : + grand = plus anormal
     return scores, y
 
 def anomalies_isoforest(X: np.ndarray, contamination: float, n_estimators: int = 200, max_samples: str | int = "auto") -> Tuple[np.ndarray, np.ndarray]:
@@ -200,12 +197,10 @@ def anomalies_isoforest(X: np.ndarray, contamination: float, n_estimators: int =
         max_samples=max_samples,
         contamination=contamination,
         random_state=42,
-        n_jobs=-1,
-        warm_start=False
+        n_jobs=-1
     )
     y = iso.fit_predict(X)  # -1 = outlier
-    # decision_function : plus grand = plus normal. On renverse pour avoir 'grand = plus anormal'.
-    scores = -iso.decision_function(X)
+    scores = -iso.decision_function(X)  # renversé : + grand = plus anormal
     return scores, y
 
 def anomalies_autoencodeur(X: np.ndarray, contamination: float, hidden: int = 8, max_iter: int = 400) -> Tuple[np.ndarray, np.ndarray]:
@@ -237,19 +232,38 @@ def anomalies_autoencodeur(X: np.ndarray, contamination: float, hidden: int = 8,
     return scores, y
 
 # =============================
+# Projection 2D (PCA / t-SNE) pour visualisation
+# =============================
+
+def projeter_2d(X: np.ndarray, methode: str) -> np.ndarray:
+    """Projette X en 2D avec PCA (rapide) ou t-SNE (plus lent). Retourne un tableau (n,2)."""
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    if methode == "t-SNE (lent)":
+        from sklearn.manifold import TSNE
+        emb = TSNE(n_components=2, learning_rate="auto", init="pca", perplexity=30, random_state=42).fit_transform(Xs)
+    else:
+        # PCA rapide et stable
+        from sklearn.decomposition import PCA
+        emb = PCA(n_components=2, random_state=42).fit_transform(Xs)
+    return emb
+
+# =============================
 # Page Streamlit
 # =============================
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Tests anomalies (LOF / ISO / Auto-Encodeur)", layout="wide")
-st.title("Tests d’anomalies sur indicateurs de mouvement")
+st.set_page_config(page_title="Tests anomalies + projection 2D", layout="wide")
+st.title("Tests d’anomalies sur indicateurs + projection 2D")
 st.markdown("www.codeandcortex.fr")
 
 st.markdown(
     "Cette page calcule des indicateurs de mouvement par flux optique entre images successives, "
-    "puis teste une méthode de détection d’anomalies au choix. "
-    "Recommandation initiale : utiliser la combinaison « magnitude moyenne + énergie du mouvement »."
+    "applique une méthode d’anomalies, puis projette les points (pas) en 2D pour une visualisation de type clustering. "
+    "Les **anomalies sont affichées en rouge**, les autres en bleu."
 )
 
 # Vérifications préalables
@@ -298,28 +312,22 @@ with c3:
 with c4:
     choix_feat = st.selectbox("Indicateurs utilisés", ["Magnitude seule", "Magnitude + énergie", "Tous les indicateurs"])
 
-# Choix de la méthode d’anomalies et hyperparamètres
-st.subheader("Méthode d’anomalies")
-methode = st.selectbox("Choisir la méthode", ["Local Outlier Factor", "Isolation Forest", "Auto-Encodeur"])
+# Choix méthode anomalies + projection 2D
+st.subheader("Méthode d’anomalies et projection")
+methode = st.selectbox("Méthode", ["Local Outlier Factor", "Isolation Forest", "Auto-Encodeur"])
+cL, cR = st.columns(2)
+with cL:
+    projection = st.selectbox("Projection 2D", ["PCA (rapide)", "t-SNE (lent)"], index=0)
+with cR:
+    contamination = st.slider("Contamination (proportion attendue d’anomalies)", 0.01, 0.4, 0.1, 0.01)
 
+# Hyperparamètres spécifiques
 if methode == "Local Outlier Factor":
-    cL1, cL2 = st.columns(2)
-    with cL1:
-        contamination = st.slider("Contamination (proportion attendue d’anomalies)", 0.01, 0.4, 0.1, 0.01)
-    with cL2:
-        n_neighbors = st.number_input("n_neighbors (LOF)", min_value=5, max_value=100, value=20, step=1)
+    n_neighbors = st.number_input("n_neighbors (LOF)", min_value=5, max_value=100, value=20, step=1)
 elif methode == "Isolation Forest":
-    cI1, cI2 = st.columns(2)
-    with cI1:
-        contamination = st.slider("Contamination (proportion attendue d’anomalies)", 0.01, 0.4, 0.1, 0.01)
-    with cI2:
-        n_estimators = st.number_input("n_estimators (ISO)", min_value=50, max_value=1000, value=200, step=50)
-else:
-    cA1, cA2 = st.columns(2)
-    with cA1:
-        contamination = st.slider("Contamination (proportion attendue d’anomalies)", 0.01, 0.4, 0.1, 0.01)
-    with cA2:
-        hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
+    n_estimators = st.number_input("n_estimators (ISO)", min_value=50, max_value=1000, value=200, step=50)
+else:  # Auto-encodeur
+    hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
 
 # Lancement
 if st.button("Lancer les tests", type="primary"):
@@ -359,12 +367,7 @@ if st.button("Lancer les tests", type="primary"):
         if met is None:
             echecs += 1
             continue
-        lignes.append({
-            "etape": k,
-            "frame_prev": i0,
-            "frame_curr": i1,
-            **met
-        })
+        lignes.append({"etape": k, "frame_prev": i0, "frame_curr": i1, **met})
 
     if not lignes:
         st.error("Aucune paire exploitable pour calculer les indicateurs. Essaie pas=1.")
@@ -377,7 +380,7 @@ if st.button("Lancer les tests", type="primary"):
     # Choix des features et construction X
     X, cols = construire_X(df, choix_feat)
 
-    # Lancement de la méthode sélectionnée
+    # Méthode d’anomalies
     try:
         if methode == "Local Outlier Factor":
             scores, ypred = anomalies_lof(X, contamination=float(contamination), n_neighbors=int(n_neighbors))
@@ -386,51 +389,98 @@ if st.button("Lancer les tests", type="primary"):
         else:
             scores, ypred = anomalies_autoencodeur(X, contamination=float(contamination), hidden=int(hidden))
     except Exception as e:
-        st.error(f"Échec de la méthode '{methode}' : {e}. Vérifie que scikit-learn est disponible dans requirements.txt.")
+        st.error(f"Échec de la méthode '{methode}' : {e}. Vérifie scikit-learn dans requirements.txt.")
         st.stop()
 
-    # Intégration des résultats
     df["score_anomalie"] = scores
     df["anomalie"] = (ypred == -1)
 
     # Résumés
-    st.subheader("Résumé et choix des indicateurs")
-    st.write(f"Indicateurs utilisés : {', '.join(cols)}")
-    st.write(f"Méthode : {methode}  |  Contamination attendue : {float(contamination):.2f}")
+    st.subheader("Résumé et indicateurs utilisés")
+    st.write(f"Indicateurs : {', '.join(cols)}")
+    st.write(f"Méthode : {methode}  |  Contamination : {float(contamination):.2f}")
     nb_ano = int(df["anomalie"].sum())
-    st.write(f"Nombre d’anomalies détectées : {nb_ano} / {len(df)} pas")
+    st.write(f"Anomalies détectées : {nb_ano} / {len(df)} pas")
 
-    # Courbes
+    # Courbe des scores
     st.subheader("Courbe du score d’anomalie")
     st.line_chart(df.set_index("etape")[["score_anomalie"]])
+
+    # ========= NOUVEAU : Projection 2D et nuage de points "type clustering" =========
+    st.subheader("Projection 2D des pas (clustering visuel)")
+    st.caption(
+        "La projection 2D (PCA ou t-SNE) place chaque pas comme un point. "
+        "Les anomalies (rouge) se regroupent souvent en zones périphériques ou isolées."
+    )
+    try:
+        emb = projeter_2d(X, methode=projection)
+        df_proj = pd.DataFrame({"x": emb[:, 0], "y": emb[:, 1], "anomalie": df["anomalie"], "etape": df["etape"], "frame_curr": df["frame_curr"]})
+        # Matplotlib simple, anomalies en rouge, normales en bleu
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 5))
+        normaux = df_proj[~df_proj["anomalie"]]
+        anormaux = df_proj[df_proj["anomalie"]]
+        ax.scatter(normaux["x"], normaux["y"], s=18, label="Normal", alpha=0.7)
+        ax.scatter(anormaux["x"], anormaux["y"], s=30, label="Anomalie", alpha=0.9, c="red")
+        ax.set_xlabel("Composante 1")
+        ax.set_ylabel("Composante 2")
+        ax.set_title(f"Projection 2D ({projection}) - {methode}")
+        ax.legend()
+        st.pyplot(fig)
+    except Exception as e:
+        st.warning(f"Projection 2D indisponible : {e}")
 
     # Vignettes anomalies (encadrées en rouge)
     st.subheader("Vignettes des anomalies détectées")
     if nb_ano == 0:
         st.info("Aucune anomalie détectée au seuil demandé.")
     else:
-        top = df.sort_values("score_anomalie", ascending=False).head(24)
+        # On propose deux tris : par score, ou par position dans le plan
+        tri = st.selectbox("Trier les vignettes d’anomalies", ["Score décroissant", "x croissant (projection)", "y croissant (projection)"], index=0)
+        dfa = df.copy()
+        dfa = dfa[dfa["anomalie"]]
+        if "emb" in locals():
+            dfa = dfa.join(pd.DataFrame(emb, columns=["x", "y"]), how="left")
+        if tri == "Score décroissant":
+            dfa = dfa.sort_values("score_anomalie", ascending=False)
+        elif tri == "x croissant (projection)" and "x" in dfa:
+            dfa = dfa.sort_values("x", ascending=True)
+        elif tri == "y croissant (projection)" and "y" in dfa:
+            dfa = dfa.sort_values("y", ascending=True)
+
+        # Affiche jusqu’à 24 vignettes
+        # Il nous faut les images pour les frames d'arrivée
         cols_par_ligne = 8
         k = 0
-        for _ in range(math.ceil(len(top) / cols_par_ligne)):
+        max_show = 24
+        for _ in range(math.ceil(min(len(dfa), max_show) / cols_par_ligne)):
             cols_st = st.columns(cols_par_ligne)
             for c in cols_st:
-                if k >= len(top):
+                if k >= min(len(dfa), max_show):
                     break
-                row = top.iloc[k]
+                row = dfa.iloc[k]
                 dst = int(row["frame_curr"])
-                vis = encadrer_rouge_cv2(cv2, imgs[dst], e=8)
-                c.image(vis, caption=f"frame #{dst} • score={row['score_anomalie']:.3f}", use_container_width=False)
+                # Relecture rapide de l'image depuis le cache en mémoire (imgs)
+                if 0 <= dst < len(imgs):
+                    vis = encadrer_rouge_cv2(cv2, imgs[dst], e=8)
+                    cap = f"frame #{dst} • score={row['score_anomalie']:.3f}"
+                    if "x" in row and "y" in row and not (pd.isna(row["x"]) or pd.isna(row["y"])):
+                        cap += f" • (x={row['x']:.2f}, y={row['y']:.2f})"
+                    c.image(vis, caption=cap, use_container_width=False)
                 k += 1
 
     # Tableau et export
     st.subheader("Tableau des scores et décisions")
-    st.dataframe(df[["etape", "frame_prev", "frame_curr", *cols, "score_anomalie", "anomalie"]])
+    colonnes_aff = ["etape", "frame_prev", "frame_curr", *cols, "score_anomalie", "anomalie"]
+    if "emb" in locals():
+        df["x"], df["y"] = emb[:, 0], emb[:, 1]
+        colonnes_aff += ["x", "y"]
+    st.dataframe(df[colonnes_aff])
 
     st.subheader("Exporter les résultats")
     st.download_button(
         "Télécharger les scores (CSV)",
-        data=df.to_csv(index=False).encode("utf-8"),
+        data=df[colonnes_aff].to_csv(index=False).encode("utf-8"),
         file_name="scores_anomalies.csv",
         mime="text/csv"
     )
@@ -441,41 +491,17 @@ if st.button("Lancer les tests", type="primary"):
 
 st.subheader("Explications et recommandations")
 st.markdown(
-    "Choix des indicateurs. La magnitude moyenne du flux optique résume l’intensité du mouvement entre deux images. "
-    "L’énergie de mouvement (somme des magnitudes) met l’accent sur l’étendue du mouvement dans l’image. "
-    "La combinaison « magnitude moyenne + énergie » est souvent la plus informative, car elle capte à la fois l’intensité locale et l’ampleur globale. "
-    "Les indicateurs P95 et l’écart-type sont utiles pour détecter des événements très rapides ou hétérogènes. "
-    "La direction dominante et la dispersion apportent un contexte mais sont moins directement utiles à la détection d’anomalies en 1D."
+    "Indicateurs. La **magnitude moyenne** du flux optique résume l’intensité du mouvement par pas. "
+    "L’**énergie de mouvement** (somme des magnitudes) renforce les événements étendus. "
+    "La combinaison « magnitude + énergie » est un bon point de départ. Les autres (écart-type, P95, direction, dispersion) ajoutent du contexte."
 )
-
 st.markdown(
-    "Local Outlier Factor. LOF compare la densité locale d’un point à celle de ses voisins. "
-    "Un point est anormal s’il vit dans une région de faible densité par rapport à ses proches. "
-    "Le paramètre n_neighbors règle l’échelle locale. Une contamination de 5 % à 15 % fonctionne bien en pratique. "
-    "LOF est efficace quand les anomalies sont isolées et que la distribution est non gaussienne. "
-    "Il est sensible à l’échelle des features, d’où l’intérêt de limiter les indicateurs à des grandeurs pertinentes."
+    "Méthodes. **Isolation Forest** est souvent un premier choix robuste et rapide. "
+    "**LOF** est utile si les anomalies sont isolées dans des régions de faible densité locale. "
+    "L’**auto-encodeur** capture des relations non linéaires entre indicateurs et peut mieux séparer certains motifs."
 )
-
 st.markdown(
-    "Isolation Forest. ISO isole les observations en construisant des partitions aléatoires. "
-    "Les points plus faciles à isoler sont considérés comme anormaux. "
-    "Ce modèle est robuste en haute dimension et nécessite peu de réglages. "
-    "La contamination fixe le pourcentage attendu d’anomalies et sert au seuillage interne. "
-    "C’est un bon choix par défaut si l’on veut une méthode rapide et stable."
-)
-
-st.markdown(
-    "Auto-Encodeur. Un auto-encodeur apprend à reconstruire les vecteurs d’indicateurs typiques. "
-    "Les échantillons mal reconstruits ont une erreur élevée et sont considérés comme anormaux. "
-    "Avec un petit réseau (une couche cachée), on obtient une compression non linéaire suffisante pour ces séries courtes. "
-    "La contamination sert au seuillage par quantile sur l’erreur de reconstruction. "
-    "Cette approche est intéressante quand on dispose de plusieurs indicateurs combinés."
-)
-
-st.markdown(
-    "Interprétation pratique. Si les anomalies détectées correspondent à des pics de magnitude et d’énergie, "
-    "elles marquent des passages de mouvement inhabituel. Si elles sortent surtout en LOF mais pas en ISO, "
-    "cela peut indiquer des régions de faible densité locale plutôt que des pics nets. "
-    "Commence avec « magnitude + énergie » et Isolation Forest. Si tu observes des faux positifs, essaye LOF avec un n_neighbors plus élevé. "
-    "Si tu souhaites modéliser des motifs plus complexes, passe à l’auto-encodeur."
+    "Projection 2D. La **PCA** donne une vue rapide et fiable ; le **t-SNE** (plus lent) sépare parfois mieux des structures fines. "
+    "Dans le nuage de points, les anomalies en **rouge** sont souvent en marge ou regroupées dans des zones atypiques. "
+    "Tu peux trier les vignettes en fonction de la projection pour explorer visuellement ces zones."
 )
