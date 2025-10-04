@@ -7,3 +7,4 @@ numpy>=1.26
 imageio-ffmpeg>=0.4
 openai-whisper
 scikit-learn
+matplotlib
