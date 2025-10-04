@@ -1,7 +1,8 @@
 # pages/anomalies.py
 # Analyse d'anomalies avec timeline consultable et état persistant.
+# Import MP4 rétabli (uploader) + option "Vidéo préparée".
 # - Paramètres regroupés dans un formulaire : pas de recalcul tant que tu ne cliques pas "Lancer l'analyse".
-# - Résultats conservés en session_state pour éviter toute réinitialisation lors des interactions.
+# - Résultats conservés en session_state pour éviter la réinitialisation lors des interactions.
 # - Timeline images réelle : scrubber (navigation image par image) + fenêtre temporelle [t0, t1] défilable.
 # - Axe Temps (s) cohérent : cadence fixe = frame/fps, frames natives = timestamps réels via ffprobe.
 # - Méthodes : LOF / Isolation Forest / Auto-Encodeur, projection 2D Altair, timeline des scores, vignettes, tableau, export.
@@ -284,7 +285,7 @@ with st.form("params"):
     st.subheader("Paramètres d’analyse")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        src = st.radio("Source", ["Importer un MP4", "Vidéo préparée"], index=0, horizontal=True)
+        src = st.radio("Source vidéo", ["Importer un MP4", "Vidéo préparée"], index=0, horizontal=True)
     with c2:
         mode_ext = st.radio("Extraction d’images", ["Frames natives", "Cadence fixe"], index=0)
     with c3:
@@ -313,7 +314,7 @@ with st.form("params"):
         with c9:
             hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
 
-    # Choix de la source
+    # Choix de la source + import MP4 rétabli
     video_path: Optional[Path] = None
     if src == "Importer un MP4":
         up = st.file_uploader("Importer une vidéo (.mp4)", type=["mp4"], key="upload_anom")
@@ -406,7 +407,7 @@ if lancer:
     df["anomalie"] = (ypred == -1)
     df["etat"] = np.where(df["anomalie"], "Anomalie", "Normal")
 
-    # Projection 2D mise en cache de session (selon X et projection)
+    # Projection 2D
     try:
         emb = projeter_2d(X, methode=projection)
         df["x"], df["y"] = emb[:, 0], emb[:, 1]
@@ -429,7 +430,7 @@ if lancer:
 # ----------------------------- Affichage résultats persistants -----------------------------
 res = st.session_state.get("anom")
 if not res:
-    st.info("Configure les paramètres puis clique « Lancer l’analyse » pour afficher la timeline.")
+    st.info("Importe un MP4 ou choisis « Vidéo préparée », puis clique « Lancer l’analyse ».")
     st.stop()
 
 imgs = res["imgs"]
@@ -500,14 +501,12 @@ st.subheader("Timeline images consultable")
 t_min = float(np.min(temps_par_frame)) if n > 0 else 0.0
 t_max = float(np.max(temps_par_frame)) if n > 0 else 0.0
 
-# État persistant de navigation
 st.session_state.setdefault("scrub_t", t_min)
 st.session_state.setdefault("win_t0", t_min)
 st.session_state.setdefault("win_t1", min(t_min + max(5.0, (t_max - t_min) * 0.05), t_max))
 
 cA, cB = st.columns([1, 1])
 with cA:
-    # Scrubber mono-valeur : navigation image par image
     scrub = st.slider(
         "Scrubber (temps, navigation image par image)",
         min_value=t_min, max_value=t_max,
@@ -515,7 +514,6 @@ with cA:
         step=max(0.001, (t_max - t_min) / max(1000, n))
     )
 with cB:
-    # Fenêtre temporelle défilable
     t0, t1 = st.slider(
         "Fenêtre temporelle [t0, t1] pour le ruban d’images",
         min_value=t_min, max_value=t_max,
@@ -527,11 +525,9 @@ st.session_state["scrub_t"] = float(scrub)
 st.session_state["win_t0"] = float(min(t0, t1))
 st.session_state["win_t1"] = float(max(t0, t1))
 
-# Trouve la frame la plus proche du scrubber
 idx_scrub = int(np.argmin(np.abs(temps_par_frame - st.session_state["scrub_t"])))
 frame_scrub = np.clip(idx_scrub, 0, n - 1)
 
-# Affichage de l'image courante (scrubber)
 st.markdown("Aperçu au temps sélectionné")
 is_anom = bool(df.loc[df["frame_curr"] == frame_scrub, "anomalie"].any()) if "frame_curr" in df else False
 img_scrub = encadrer_rouge_cv2(cv2, imgs[frame_scrub], e=8) if is_anom else imgs[frame_scrub]
@@ -546,7 +542,6 @@ if "score_anomalie" in df.columns:
         cap_scrub += f" • score={float(sc_scr.iloc[0]):.3f}"
 st.image(img_scrub, caption=cap_scrub, use_container_width=True)
 
-# Ruban d’images sur la fenêtre temporelle
 st.markdown("Ruban d’images sur la fenêtre temporelle")
 mask_win = (temps_par_frame >= st.session_state["win_t0"]) & (temps_par_frame <= st.session_state["win_t1"])
 idxs = np.nonzero(mask_win)[0].tolist()
