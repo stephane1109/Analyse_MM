@@ -1,7 +1,10 @@
 # pages/anomalies.py
-# Détection d'anomalies sur indicateurs de mouvement avec visualisation 2D Altair.
-# Méthodes : Local Outlier Factor, Isolation Forest, Auto-Encodeur léger (MLPRegressor).
-# Visualisation : projection 2D (PCA rapide ou t-SNE) via Altair, anomalies en rouge.
+# Détection d'anomalies sur indicateurs de mouvement avec :
+# - Extraction FFmpeg, calcul d'indicateurs (flux optique Farneback)
+# - Trois méthodes : LOF, Isolation Forest, Auto-Encodeur (MLPRegressor)
+# - Visualisation 2D Altair (PCA / t-SNE)
+# - NOUVEAU : Timeline Altair des scores avec anomalies en rouge, axe Étape / Frame / Temps (s)
+# - Vignettes d’anomalies, tableau et export CSV
 
 import math
 import shutil
@@ -256,14 +259,14 @@ def projeter_2d(X: np.ndarray, methode: str) -> np.ndarray:
 
 BASE_DIR, REP_SORTIE, REP_TMP = initialiser_repertoires()
 
-st.set_page_config(page_title="Tests anomalies + Altair 2D", layout="wide")
-st.title("Tests d’anomalies sur indicateurs + projection 2D (Altair)")
+st.set_page_config(page_title="Tests anomalies + Altair 2D + Timeline", layout="wide")
+st.title("Tests d’anomalies sur indicateurs + projection 2D et timeline")
 st.markdown("www.codeandcortex.fr")
 
 st.markdown(
     "La page calcule des indicateurs de mouvement par flux optique entre images successives, "
-    "applique une méthode d’anomalies, puis projette les pas en 2D avec **Altair**. "
-    "Les anomalies sont affichées en rouge, les normales en bleu, avec infobulles et zoom."
+    "applique une méthode d’anomalies, puis propose deux vues Altair : "
+    "un nuage 2D (PCA/t-SNE) et une **timeline** des scores où les anomalies apparaissent en **rouge**."
 )
 
 # Vérifications préalables
@@ -328,6 +331,9 @@ elif methode == "Isolation Forest":
     n_estimators = st.number_input("n_estimators (ISO)", min_value=50, max_value=1000, value=200, step=50)
 else:
     hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
+
+# Choix de l'axe de la timeline
+axe_timeline = st.radio("Axe de la timeline", ["Étape", "Frame", "Temps (s)"], index=0, horizontal=True)
 
 # Lancement
 if st.button("Lancer les tests", type="primary"):
@@ -395,59 +401,95 @@ if st.button("Lancer les tests", type="primary"):
     df["score_anomalie"] = scores
     df["anomalie"] = (ypred == -1)
 
-    # Résumés
-    st.subheader("Résumé et indicateurs utilisés")
-    st.write(f"Indicateurs : {', '.join(cols)}")
-    st.write(f"Méthode : {methode}  |  Contamination : {float(contamination):.2f}")
-    nb_ano = int(df["anomalie"].sum())
-    st.write(f"Anomalies détectées : {nb_ano} / {len(df)} pas")
-
-    # Courbe des scores
-    st.subheader("Courbe du score d’anomalie")
-    st.line_chart(df.set_index("etape")[["score_anomalie"]])
-
-    # ===== Altair : projection 2D type clustering =====
+    # =========================
+    # Projection 2D Altair
+    # =========================
     st.subheader("Projection 2D des pas (Altair)")
-    st.caption(
-        "Chaque point représente un pas (frame d’arrivée). Rouge = anomalie, Bleu = normal. "
-        "Survole pour voir les détails, utilise les contrôles Altair pour zoomer/déplacer."
-    )
+    st.caption("Chaque point est un pas (frame d’arrivée). Rouge = anomalie, Bleu = normal. Survole et zoome librement.")
     try:
         emb = projeter_2d(X, methode=projection)
         df["x"], df["y"] = emb[:, 0], emb[:, 1]
-
-        # Préparation des couleurs : bool -> libellé
         df["etat"] = np.where(df["anomalie"], "Anomalie", "Normal")
 
-        # Sélection interactive pour survol
         hover = alt.selection_point(fields=["etape"], on="mouseover", nearest=True, empty=False)
 
-        base = alt.Chart(df).mark_point(filled=True).encode(
+        base2d = alt.Chart(df).mark_point(filled=True).encode(
             x=alt.X("x:Q", title="Composante 1"),
             y=alt.Y("y:Q", title="Composante 2"),
             color=alt.Color("etat:N",
-                            scale=alt.Scale(domain=["Normal", "Anomalie"],
-                                            range=["#377eb8", "#e41a1c"]),
+                            scale=alt.Scale(domain=["Normal", "Anomalie"], range=["#377eb8", "#e41a1c"]),
                             title="État"),
-            size=alt.Size("etat:N",
-                          scale=alt.Scale(domain=["Normal", "Anomalie"], range=[30, 70]),
-                          legend=None),
-            tooltip=[
-                alt.Tooltip("etape:Q", title="Étape"),
-                alt.Tooltip("frame_curr:Q", title="Frame"),
-                alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")
-            ]
+            size=alt.Size("etat:N", scale=alt.Scale(domain=["Normal", "Anomalie"], range=[30, 70]), legend=None),
+            tooltip=[alt.Tooltip("etape:Q", title="Étape"),
+                     alt.Tooltip("frame_curr:Q", title="Frame"),
+                     alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
         ).add_params(hover).properties(width=700, height=480)
 
-        point_highlight = base.transform_filter(hover).mark_point(stroke="black", strokeWidth=1.5)
-        chart = (base + point_highlight).interactive()  # zoom/pan
-
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart((base2d + base2d.transform_filter(hover).mark_point(stroke="black", strokeWidth=1.5)).interactive(),
+                        use_container_width=True)
     except Exception as e:
         st.warning(f"Projection 2D indisponible : {e}")
 
-    # Vignettes anomalies (encadrées en rouge)
+    # =========================
+    # Timeline Altair des scores et anomalies
+    # =========================
+    st.subheader("Timeline des scores et anomalies")
+    st.caption(
+        "Choisis l’axe temporel. En cadence fixe, « Temps (s) » = frame / fps. "
+        "En frames natives, « Étape » ou « Frame » sont des repères d’ordre."
+    )
+
+    # Préparation de l'axe X
+    if axe_timeline == "Temps (s)":
+        if mode == "fixe":
+            df["t"] = df["frame_curr"].astype(float) / float(fps)
+            x_field = alt.X("t:Q", title="Temps (s)")
+        else:
+            st.info("En frames natives, la cadence n’est pas garantie : utilisation de l’axe Étape.")
+            df["t"] = df["etape"].astype(float)
+            x_field = alt.X("t:Q", title="Étape")
+    elif axe_timeline == "Frame":
+        df["t"] = df["frame_curr"].astype(float)
+        x_field = alt.X("t:Q", title="Frame")
+    else:
+        df["t"] = df["etape"].astype(float)
+        x_field = alt.X("t:Q", title="Étape")
+
+    # Série des scores
+    df["etat"] = np.where(df["anomalie"], "Anomalie", "Normal")
+
+    base_line = alt.Chart(df).mark_line().encode(
+        x=x_field,
+        y=alt.Y("score_anomalie:Q", title="Score d’anomalie"),
+        tooltip=[alt.Tooltip("etape:Q", title="Étape"),
+                 alt.Tooltip("frame_curr:Q", title="Frame"),
+                 alt.Tooltip("score_anomalie:Q", title="Score", format=".3f")]
+    ).properties(width=900, height=320)
+
+    points_normaux = alt.Chart(df[df["anomalie"] == False]).mark_point(filled=True).encode(
+        x=x_field,
+        y=alt.Y("score_anomalie:Q"),
+        color=alt.value("#377eb8"),
+        size=alt.value(30),
+        tooltip=[alt.Tooltip("etape:Q"), alt.Tooltip("frame_curr:Q"), alt.Tooltip("score_anomalie:Q", format=".3f")]
+    )
+
+    points_anom = alt.Chart(df[df["anomalie"] == True]).mark_point(filled=True).encode(
+        x=x_field,
+        y=alt.Y("score_anomalie:Q"),
+        color=alt.value("#e41a1c"),
+        size=alt.value(70),
+        tooltip=[alt.Tooltip("etape:Q"), alt.Tooltip("frame_curr:Q"), alt.Tooltip("score_anomalie:Q", format=".3f")]
+    )
+
+    chart_timeline = (base_line + points_normaux + points_anom).interactive()
+    st.altair_chart(chart_timeline, use_container_width=True)
+
+    # =========================
+    # Vignettes anomalies
+    # =========================
     st.subheader("Vignettes des anomalies détectées")
+    nb_ano = int(df["anomalie"].sum())
     if nb_ano == 0:
         st.info("Aucune anomalie détectée au seuil demandé.")
     else:
@@ -478,11 +520,15 @@ if st.button("Lancer les tests", type="primary"):
                     c.image(vis, caption=cap, use_container_width=False)
                 k += 1
 
-    # Tableau et export
+    # =========================
+    # Table et export
+    # =========================
     st.subheader("Tableau des scores et décisions")
     colonnes_aff = ["etape", "frame_prev", "frame_curr", *cols, "score_anomalie", "anomalie"]
     if "x" in df and "y" in df:
         colonnes_aff += ["x", "y"]
+    if "t" in df:
+        colonnes_aff = ["t"] + colonnes_aff  # place l’axe choisi en première colonne
     st.dataframe(df[colonnes_aff])
 
     st.subheader("Exporter les résultats")
@@ -492,22 +538,3 @@ if st.button("Lancer les tests", type="primary"):
         file_name="scores_anomalies.csv",
         mime="text/csv"
     )
-
-# =============================
-# Explications méthodologiques
-# =============================
-
-st.subheader("Explications et recommandations")
-st.markdown(
-    "Indicateurs. La magnitude moyenne du flux optique résume l’intensité du mouvement par pas. "
-    "L’énergie de mouvement (somme des magnitudes) renforce les événements étendus. "
-    "La combinaison « magnitude + énergie » est un bon point de départ. Les autres (écart-type, P95, direction, dispersion) ajoutent du contexte."
-)
-st.markdown(
-    "Méthodes. Isolation Forest est un choix robuste et rapide. LOF met l’accent sur la densité locale. "
-    "L’auto-encodeur capture des relations non linéaires entre indicateurs et peut mieux séparer certains motifs."
-)
-st.markdown(
-    "Projection 2D. La PCA donne une vue rapide ; le t-SNE sépare parfois mieux des structures fines. "
-    "Dans le nuage de points Altair, les anomalies en rouge sont souvent en marge ou en petits amas isolés."
-)
