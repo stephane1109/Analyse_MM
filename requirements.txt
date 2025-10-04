@@ -9,3 +9,5 @@ openai-whisper
 scikit-learn
 matplotlib
 altair
+torch
+faster-whisper==1
