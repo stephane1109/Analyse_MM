@@ -1,8 +1,8 @@
 # pages/anomalies.py
 # Analyse d'anomalies avec timeline consultable et état persistant.
-# Import MP4 rétabli (uploader) + option "Vidéo préparée".
-# - Paramètres regroupés dans un formulaire : pas de recalcul tant que tu ne cliques pas "Lancer l'analyse".
-# - Résultats conservés en session_state pour éviter la réinitialisation lors des interactions.
+# Import MP4 rétabli en haut de page (uploader hors formulaire) + option "Vidéo préparée".
+# - Paramètres regroupés dans un formulaire : pas de recalcul tant que l’on ne clique pas "Lancer l’analyse".
+# - Résultats conservés en session_state pour éviter la réinitialisation lors des interactions d’affichage.
 # - Timeline images réelle : scrubber (navigation image par image) + fenêtre temporelle [t0, t1] défilable.
 # - Axe Temps (s) cohérent : cadence fixe = frame/fps, frames natives = timestamps réels via ffprobe.
 # - Méthodes : LOF / Isolation Forest / Auto-Encodeur, projection 2D Altair, timeline des scores, vignettes, tableau, export.
@@ -279,13 +279,29 @@ if cv2 is None:
 
 # État global des résultats
 st.session_state.setdefault("anom", None)
+st.session_state.setdefault("video_upload_path", None)
+
+# ----------------------------- Import MP4 hors formulaire -----------------------------
+st.subheader("Importer un MP4")
+up = st.file_uploader("Importer une vidéo (.mp4)", type=["mp4"], key="upload_mp4_global")
+if up is not None:
+    tmp = REP_TMP / f"anom_{up.name}"
+    with open(tmp, "wb") as g:
+        g.write(up.read())
+    st.session_state["video_upload_path"] = str(tmp)
+    st.success(f"Fichier importé : {tmp.name}")
 
 # ----------------------------- Formulaire paramètres -----------------------------
 with st.form("params"):
     st.subheader("Paramètres d’analyse")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        src = st.radio("Source vidéo", ["Importer un MP4", "Vidéo préparée"], index=0, horizontal=True)
+        source_choisie = st.radio(
+            "Source vidéo",
+            ["Vidéo importée ci-dessus", "Vidéo préparée"],
+            index=0 if st.session_state.get("video_upload_path") else 1,
+            horizontal=True
+        )
     with c2:
         mode_ext = st.radio("Extraction d’images", ["Frames natives", "Cadence fixe"], index=0)
     with c3:
@@ -314,34 +330,30 @@ with st.form("params"):
         with c9:
             hidden = st.number_input("Taille couche cachée (Auto-Enc.)", min_value=2, max_value=128, value=8, step=1)
 
-    # Choix de la source + import MP4 rétabli
+    lancer = st.form_submit_button("Lancer l’analyse", type="primary")
+
+# ----------------------------- Exécution unique de l’analyse -----------------------------
+if lancer:
+    # Résolution de la source vidéo
     video_path: Optional[Path] = None
-    if src == "Importer un MP4":
-        up = st.file_uploader("Importer une vidéo (.mp4)", type=["mp4"], key="upload_anom")
-        if up is not None:
-            tmp = REP_TMP / f"anom_{up.name}"
-            with open(tmp, "wb") as g:
-                g.write(up.read())
-            video_path = tmp
-            st.success(f"Fichier chargé : {tmp.name}")
+    if source_choisie == "Vidéo importée ci-dessus":
+        vup = st.session_state.get("video_upload_path")
+        if vup:
+            video_path = Path(vup)
+        else:
+            st.error("Aucune vidéo importée. Utilise le bouton d’upload en haut de page.")
+            st.stop()
     else:
         if st.session_state.get("video_base"):
             p = Path(st.session_state["video_base"])
             if p.exists():
                 video_path = p
-                st.info(f"Vidéo préparée utilisée : {p.name}")
             else:
-                st.warning("La vidéo préparée est introuvable.")
+                st.error("La vidéo préparée est introuvable sur le disque.")
+                st.stop()
         else:
-            st.warning("Aucune vidéo préparée en session.")
-
-    lancer = st.form_submit_button("Lancer l’analyse", type="primary")
-
-# ----------------------------- Exécution unique de l’analyse -----------------------------
-if lancer:
-    if video_path is None:
-        st.error("Aucune source vidéo.")
-        st.stop()
+            st.error("Aucune vidéo préparée n’est disponible en session.")
+            st.stop()
 
     frames_dir = (BASE_DIR / "frames_anom" / video_path.stem).resolve()
     mode = "natifs" if mode_ext == "Frames natives" else "fixe"
@@ -369,7 +381,7 @@ if lancer:
                 extra = np.linspace(dernier, dernier + (n - m) * 1.0 / max(1, fps), num=(n - m), endpoint=False)
                 temps_par_frame = np.concatenate([temps_par_frame, extra])
         else:
-            temps_par_frame = np.arange(n, dtype=float)  # fallback
+            temps_par_frame = np.arange(n, dtype=float)  # fallback si ffprobe indisponible
     else:
         temps_par_frame = np.arange(n, dtype=float) / float(max(1, fps))
 
@@ -430,7 +442,7 @@ if lancer:
 # ----------------------------- Affichage résultats persistants -----------------------------
 res = st.session_state.get("anom")
 if not res:
-    st.info("Importe un MP4 ou choisis « Vidéo préparée », puis clique « Lancer l’analyse ».")
+    st.info("Importe un MP4 via le bouton ci-dessus ou choisis « Vidéo préparée », puis clique « Lancer l’analyse ».")
     st.stop()
 
 imgs = res["imgs"]
